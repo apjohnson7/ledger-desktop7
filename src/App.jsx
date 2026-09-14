@@ -251,7 +251,7 @@ const seedData = () => ({
   fundRepayments: [],
   auditLog: [],
   users: [],
-  settings: { businessName: "My Lending Business", language: "en", startingCashBalance: 0 }
+  settings: { businessName: "My Lending Business", language: "en", startingCashBalance: 0, customFields: [] }
 });
 
 /* -------------------------------- roles & access -------------------------------- */
@@ -319,6 +319,8 @@ export default function App() {
       if (!base.fundRepayments) base.fundRepayments = [];
       if (!base.auditLog) base.auditLog = [];
       if (base.settings && base.settings.startingCashBalance === undefined) base.settings.startingCashBalance = 0;
+      if (!base.settings) base.settings = { businessName: "My Lending Business", language: "en", startingCashBalance: 0 };
+      if (!Array.isArray(base.settings.customFields)) base.settings.customFields = [];
       setData(base);
       setLoaded(true);
     })();
@@ -2358,9 +2360,11 @@ function Reports({ data }) {
 
 /* --------------------------------- settings --------------------------------- */
 
-function SettingsPage({ data, update, showToast, t }) {
+function SettingsPage({ data, update, showToast, t, role, setModal }) {
   const [name, setName] = useState(data.settings.businessName);
   const [startingBalance, setStartingBalance] = useState(String(data.settings.startingCashBalance ?? 0));
+  const [fieldLabel, setFieldLabel] = useState("");
+  const [fieldScope, setFieldScope] = useState("borrowers");
   const fileInputRef = useRef(null);
 
   const exportData = () => {
@@ -2395,6 +2399,34 @@ function SettingsPage({ data, update, showToast, t }) {
     e.target.value = "";
   };
 
+  const addCustomField = () => {
+    const label = fieldLabel.trim();
+    if (!label) return showToast("Enter a field name first.");
+    update((d) => {
+      if (!Array.isArray(d.settings.customFields)) d.settings.customFields = [];
+      if (d.settings.customFields.some((field) => field.label.toLowerCase() === label.toLowerCase() && field.scope === fieldScope)) return;
+      d.settings.customFields.push({ id: uid("field"), label, scope: fieldScope, createdAt: new Date().toISOString() });
+    }, `Added custom ${fieldScope === "borrowers" ? "borrower" : "loan"} field "${label}"`);
+    setFieldLabel("");
+    showToast("Custom field added.");
+  };
+
+  const deleteCustomField = (field) => {
+    if (!role.manageUsers) return showToast("Only an administrator can delete fields.");
+    setModal({
+      type: "confirmDelete", payload: {
+        title: "Delete custom field",
+        message: `Delete the "${field.label}" field from ${field.scope}? Existing records are kept, but this field definition will no longer be available.`,
+        onConfirm: () => {
+          update((d) => {
+            d.settings.customFields = (d.settings.customFields || []).filter((item) => item.id !== field.id);
+          }, `Deleted custom ${field.scope === "borrowers" ? "borrower" : "loan"} field "${field.label}"`);
+          showToast("Custom field deleted.");
+        },
+      },
+    });
+  };
+
   return (
     <div>
       <SectionTitle>Settings</SectionTitle>
@@ -2409,6 +2441,33 @@ function SettingsPage({ data, update, showToast, t }) {
           update((d) => { d.settings.businessName = name; d.settings.startingCashBalance = Number(startingBalance) || 0; }, "Updated business settings");
           showToast("Settings saved.");
         }}>Save changes</button>
+      </Card>
+
+      <Card style={{ maxWidth: 620, marginBottom: 14 }}>
+        <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 4 }}>Custom fields</div>
+        <div style={{ fontSize: 14, color: C.ink3, lineHeight: 1.5, marginBottom: 12 }}>
+          Add fields for borrower or loan records. Only an Administrator can permanently remove a field definition.
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+          <input style={{ ...FieldStyle.input, flex: "1 1 220px" }} value={fieldLabel} onChange={(e) => setFieldLabel(e.target.value)} placeholder="Field name" onKeyDown={(e) => { if (e.key === "Enter") addCustomField(); }} />
+          <select style={{ ...FieldStyle.input, width: 150 }} value={fieldScope} onChange={(e) => setFieldScope(e.target.value)}>
+            <option value="borrowers">Borrowers</option>
+            <option value="loans">Loans</option>
+          </select>
+          <button style={Btn.secondary} onClick={addCustomField}><Plus size={14} /> Add field</button>
+        </div>
+        {(data.settings.customFields || []).length === 0 ? (
+          <div style={{ fontSize: 14, color: C.ink4 }}>No custom fields configured.</div>
+        ) : (
+          <div style={{ borderTop: `1px solid ${C.border}` }}>
+            {(data.settings.customFields || []).map((field) => (
+              <div key={field.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "10px 0", borderBottom: `1px solid ${C.border}` }}>
+                <div><div style={{ fontWeight: 600, fontSize: 15 }}>{field.label}</div><div style={{ color: C.ink3, fontSize: 13 }}>{field.scope === "borrowers" ? "Borrower field" : "Loan field"}</div></div>
+                {role.manageUsers ? <button style={Btn.danger} onClick={() => deleteCustomField(field)}><Trash2 size={13} /> Delete</button> : <span style={{ color: C.ink4, fontSize: 13 }}>Administrator only</span>}
+              </div>
+            ))}
+          </div>
+        )}
       </Card>
 
       <Card style={{ maxWidth: 460, marginBottom: 14 }}>
