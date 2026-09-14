@@ -11,7 +11,8 @@
     "dev": "concurrently -k \"npm:dev:vite\" \"wait-on http://localhost:5173 && npm run dev:electron\"",
     "build": "vite build",
     "dist": "npm run build && electron-builder --win --publish never",
-    "dist:win": "npm run dist"
+    "dist:win": "npm run dist",
+    "dist:mac": "npm run build && electron-builder --mac dmg --publish never"
   },
   "dependencies": {
     "lucide-react": "^0.383.0",
