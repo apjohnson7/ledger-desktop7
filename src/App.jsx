@@ -102,6 +102,7 @@ const FREQ_DAYS = { Daily: 1, Weekly: 7, Monthly: 30, Custom: 30 };
 const PHONE_REGEX = /^(07|03|04)\d{8}$/;
 const digitsOnly = (v) => v.replace(/\D/g, "").slice(0, 10);
 const ninChars = (v) => v.replace(/\s/g, "").toUpperCase().slice(0, 14);
+const normalizedName = (v) => String(v || "").trim().toLowerCase().replace(/\s+/g, " ");
 const isValidPhone = (v) => !v || PHONE_REGEX.test(v);
 const isValidNin = (v) => !v || v.length === 14;
 
@@ -3032,8 +3033,8 @@ function NotificationsModal({ overdueLoans, soonLoans, autoRenewedToday, data, c
 }
 
 function ModalRouter({ modal, close, data, update, showToast, goBorrower, goLoan, setModal, currentUser, t }) {
-  if (modal.type === "borrower") return <BorrowerForm data={data} update={update} showToast={showToast} close={close} existing={modal.payload} goBorrower={goBorrower} />;
-  if (modal.type === "loan") return <LoanForm data={data} update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} goLoan={goLoan} setModal={setModal} />;
+  if (modal.type === "borrower") return <BorrowerForm data={data} update={update} showToast={showToast} close={close} existing={modal.payload} goBorrower={goBorrower} role={role} currentUser={currentUser} />;
+  if (modal.type === "loan") return <LoanForm data={data} update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} goLoan={goLoan} setModal={setModal} role={role} currentUser={currentUser} />;
   if (modal.type === "payment") return <PaymentForm data={data} update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} />;
   if (modal.type === "collateral") return <CollateralForm data={data} update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} t={t} />;
   if (modal.type === "expense") return <ExpenseForm update={update} showToast={showToast} close={close} existing={modal.payload} />;
@@ -3465,7 +3466,7 @@ function RenewLoanForm({ data, update, showToast, close, payload, goLoan }) {
   );
 }
 
-function BorrowerForm({ data, update, showToast, close, existing, goBorrower }) {
+function BorrowerForm({ data, update, showToast, close, existing, goBorrower, role, currentUser }) {
   const [f, setF] = useState(existing || {
     fullName: "", phone: "", altPhone: "", nationalId: "", address: "", occupation: "",
     nextOfKin: "", nextOfKinPhone: "", notes: "",
@@ -3481,6 +3482,10 @@ function BorrowerForm({ data, update, showToast, close, existing, goBorrower }) 
     if (f.altPhone && !isValidPhone(f.altPhone)) return showToast("Alternative phone number must be exactly 10 digits, starting with 07, 03, or 04.");
     if (f.nextOfKinPhone && !isValidPhone(f.nextOfKinPhone)) return showToast("Next of kin phone number must be exactly 10 digits, starting with 07, 03, or 04.");
     if (f.nationalId && !isValidNin(f.nationalId)) return showToast("National ID number must be exactly 14 characters.");
+    const duplicate = data.borrowers.find((borrower) => borrower.id !== existing?.id
+      && normalizedName(borrower.fullName) === normalizedName(f.fullName)
+      && digitsOnly(borrower.phone) === digitsOnly(f.phone));
+    if (!existing && duplicate && !window.confirm(`A borrower named "${duplicate.fullName}" already exists with this phone number. Continue creating a duplicate entry?`)) return;
     if (existing) {
       update((d) => { Object.assign(d.borrowers.find((b) => b.id === existing.id), f); }, `Edited borrower profile "${f.fullName.trim()}"`);
       showToast("Borrower profile updated.");
@@ -3522,7 +3527,7 @@ function BorrowerForm({ data, update, showToast, close, existing, goBorrower }) 
   );
 }
 
-function LoanForm({ data, update, showToast, close, payload, goLoan, setModal }) {
+function LoanForm({ data, update, showToast, close, payload, goLoan, setModal, role, currentUser }) {
   const [borrowerId, setBorrowerId] = useState(payload?.borrowerId || "");
   const [bq, setBq] = useState("");
   const [amount, setAmount] = useState("");
@@ -3579,6 +3584,13 @@ function LoanForm({ data, update, showToast, close, payload, goLoan, setModal })
     if (repaymentMethod === "Instalments" && (!instCount || !instAmount || !instFirst)) return showToast("Fill in all instalment details.");
     if (hasCollateral && !col.description.trim()) return showToast("Describe the security/collateral, or turn that section off.");
     if (isHistorical && priorPaid && Number(priorPaid) > totalPayable) return showToast("Amount already paid can't be more than the total amount payable.");
+
+    const duplicate = data.loans.find((loan) => !loan.voided
+      && loan.borrowerId === borrowerId
+      && Number(loan.amount) === Number(amount)
+      && loan.issueDate === issueDate
+      && loan.dueDate === dueDate);
+    if (duplicate && !window.confirm(`A loan for ${selectedBorrower?.fullName || "this borrower"} with the same amount and dates already exists (${duplicate.loanNumber}). Continue creating another entry?`)) return;
 
     const count = (data.loans.filter(l=>l.loanNumber?.startsWith(`LN-${new Date().getFullYear()}`)).length) + 1;
     const loanNumber = `LN-${new Date().getFullYear()}-${String(count).padStart(4, "0")}`;
