@@ -25,6 +25,11 @@ const fmt = (n) => {
 };
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
+const addDays = (dateStr, days) => {
+  const date = new Date(`${dateStr}T00:00:00`);
+  date.setDate(date.getDate() + days);
+  return date.toISOString().slice(0, 10);
+};
 const uid = (p) => `${p}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
 
 /* -------------------------------- password hashing --------------------------------
@@ -250,6 +255,7 @@ const seedData = () => ({
   externalFunds: [],
   fundRepayments: [],
   auditLog: [],
+  deletionRequests: [],
   users: [],
   settings: { businessName: "My Lending Business", language: "en", startingCashBalance: 0, customFields: [] }
 });
@@ -260,7 +266,7 @@ const ROLES = {
   Administrator: {
     label: "Administrator",
     description: "Full access to every module, plus user management.",
-    pages: ["dashboard", "borrowers", "loans", "payments", "collateral", "expenses", "funding", "reports", "settings", "users", "audit"],
+    pages: ["dashboard", "borrowers", "loans", "payments", "collateral", "expenses", "funding", "reports", "settings", "users", "audit", "approvals"],
     manageUsers: true,
   },
   Manager: {
@@ -318,6 +324,7 @@ export default function App() {
       if (!base.externalFunds) base.externalFunds = [];
       if (!base.fundRepayments) base.fundRepayments = [];
       if (!base.auditLog) base.auditLog = [];
+      if (!Array.isArray(base.deletionRequests)) base.deletionRequests = [];
       if (base.settings && base.settings.startingCashBalance === undefined) base.settings.startingCashBalance = 0;
       if (!base.settings) base.settings = { businessName: "My Lending Business", language: "en", startingCashBalance: 0 };
       if (!Array.isArray(base.settings.customFields)) base.settings.customFields = [];
@@ -494,6 +501,7 @@ export default function App() {
               {safePage === "settings" && <SettingsPage {...ctx} />}
               {safePage === "users" && role.manageUsers && <UsersPage {...ctx} />}
               {safePage === "audit" && role.manageUsers && <AuditLogPage {...ctx} />}
+              {safePage === "approvals" && role.manageUsers && <ApprovalsPage {...ctx} />}
             </>
           )}
         </div>
@@ -576,6 +584,7 @@ const NAV = [
   { id: "settings", label: "Settings", icon: SettingsIcon },
   { id: "users", label: "Users", icon: ShieldCheck },
   { id: "audit", label: "Audit Log", icon: History },
+  { id: "approvals", label: "Approvals", icon: CheckCircle2 },
 ];
 
 function Sidebar({ page, setPage, navOpen, setNavOpen, businessName, allowedPages }) {
@@ -1095,7 +1104,7 @@ function Borrowers({ data, goBorrower, setModal, t }) {
   );
 }
 
-function BorrowerDetail({ data, borrowerId, setPage, goLoan, setModal, t, update, showToast }) {
+function BorrowerDetail({ data, borrowerId, setPage, goLoan, setModal, t, update, showToast, role, currentUser }) {
   const b = data.borrowers.find((x) => x.id === borrowerId);
   if (!b) return <EmptyState icon={Users} title="Borrower not found" />;
   const loans = data.loans.filter((l) => l.borrowerId === b.id);
@@ -1117,22 +1126,12 @@ function BorrowerDetail({ data, borrowerId, setPage, goLoan, setModal, t, update
           <button style={Btn.secondary} onClick={() => downloadBorrowerRecordCSV(data, b)}><Download size={13} /> Download CSV</button>
           <button style={Btn.secondary} onClick={() => setModal({ type: "borrower", payload: b })}><Edit2 size={13} /> Edit profile</button>
           <button style={Btn.primary} onClick={() => setModal({ type: "loan", payload: { borrowerId: b.id } })}><Plus size={13} /> New loan</button>
-          <button style={Btn.danger} onClick={() => setModal({
-            type: "confirmDelete", payload: {
-              title: "Delete borrower permanently",
-              message: `Permanently delete "${b.fullName}"? This will also delete their ${loans.length} loan${loans.length !== 1 ? "s" : ""}, ${payments.length} payment${payments.length !== 1 ? "s" : ""}, and ${collateral.length} collateral record${collateral.length !== 1 ? "s" : ""}. This cannot be undone.`,
-              onConfirm: () => {
-                update((d) => {
-                  const loanIds = d.loans.filter((l) => l.borrowerId === b.id).map((l) => l.id);
-                  d.payments = d.payments.filter((p) => !loanIds.includes(p.loanId));
-                  d.collateral = d.collateral.filter((c) => !loanIds.includes(c.loanId));
-                  d.loans = d.loans.filter((l) => l.borrowerId !== b.id);
-                  d.borrowers = d.borrowers.filter((x) => x.id !== b.id);
-                }, `Deleted borrower "${b.fullName}" and all their records`);
-                showToast("Borrower and all related records deleted.");
-                setPage("borrowers");
-              },
-            }
+          <button style={Btn.danger} onClick={() => confirmOrRequestDelete({
+            role, currentUser, update, showToast, setModal,
+            entityType: "borrower", entityId: b.id, entityLabel: `borrower "${b.fullName}"`,
+            title: "Delete borrower permanently",
+            message: `Permanently delete "${b.fullName}"? This will also delete their ${loans.length} loan${loans.length !== 1 ? "s" : ""}, ${payments.length} payment${payments.length !== 1 ? "s" : ""}, and ${collateral.length} collateral record${collateral.length !== 1 ? "s" : ""}. This cannot be undone.`,
+            onDeleted: () => setPage("borrowers"),
           })}><Ban size={13} /> Delete</button>
         </div>
       </div>
@@ -1423,7 +1422,7 @@ function Loans({ data, goLoan, setModal, update, showToast }) {
   );
 }
 
-function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorrower, goLoan, t }) {
+function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorrower, goLoan, t, role, currentUser }) {
   const l = data.loans.find((x) => x.id === loanId);
   if (!l) return <EmptyState icon={Wallet} title="Loan not found" />;
   const borrower = data.borrowers.find((b) => b.id === l.borrowerId);
@@ -1482,20 +1481,12 @@ function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorr
               <button style={Btn.danger} onClick={voidLoan}><Ban size={13} /> Void</button>
             </>
           )}
-          <button style={Btn.danger} onClick={() => setModal({
-            type: "confirmDelete", payload: {
-              title: "Delete loan permanently",
-              message: `Permanently delete loan ${l.loanNumber} for ${borrower?.fullName}? This will also permanently delete its ${payments.length} payment${payments.length !== 1 ? "s" : ""} and ${collateral.length} collateral record${collateral.length !== 1 ? "s" : ""}. This cannot be undone and is different from Void, which keeps history. Consider Void instead unless this loan was created by mistake.`,
-              onConfirm: () => {
-                update((d) => {
-                  d.payments = d.payments.filter((p) => p.loanId !== l.id);
-                  d.collateral = d.collateral.filter((c) => c.loanId !== l.id);
-                  d.loans = d.loans.filter((x) => x.id !== l.id);
-                }, `Permanently deleted loan ${l.loanNumber}`);
-                showToast("Loan permanently deleted.");
-                setPage("loans");
-              }
-            }
+          <button style={Btn.danger} onClick={() => confirmOrRequestDelete({
+            role, currentUser, update, showToast, setModal,
+            entityType: "loan", entityId: l.id, entityLabel: `loan ${l.loanNumber}`,
+            title: "Delete loan permanently",
+            message: `Permanently delete loan ${l.loanNumber} for ${borrower?.fullName}? This will also permanently delete its ${payments.length} payment${payments.length !== 1 ? "s" : ""} and ${collateral.length} collateral record${collateral.length !== 1 ? "s" : ""}. This cannot be undone and is different from Void, which keeps history. Consider Void instead unless this loan was created by mistake.`,
+            onDeleted: () => setPage("loans"),
           })}><Ban size={13} /> Delete permanently</button>
         </div>
       </div>
@@ -1585,14 +1576,10 @@ function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorr
                     }}><PackageCheck size={13} /> Mark as Paid</button>
                   )}
                   <button style={{ ...Btn.ghost, padding: "4px 6px", fontSize: 13.5 }} onClick={() => setModal({ type: "collateral", payload: { existing: c } })}><Edit2 size={13} /></button>
-                  <button style={{ ...Btn.ghost, padding: "4px 6px", fontSize: 13.5, color: C.rust }} onClick={() => setModal({
-                    type: "confirmDelete", payload: {
-                      title: "Delete collateral record", message: `Permanently delete "${c.description}" from this loan? This cannot be undone.`,
-                      onConfirm: () => {
-                        update((d) => { d.collateral = d.collateral.filter((x) => x.id !== c.id); }, `Deleted collateral "${c.description}" (loan ${l.loanNumber})`);
-                        showToast("Collateral record deleted.");
-                      }
-                    }
+                  <button style={{ ...Btn.ghost, padding: "4px 6px", fontSize: 13.5, color: C.rust }} onClick={() => confirmOrRequestDelete({
+                    role, currentUser, update, showToast, setModal,
+                    entityType: "collateral", entityId: c.id, entityLabel: `collateral "${c.description}"`,
+                    title: "Delete collateral record", message: `Permanently delete "${c.description}" from this loan? This cannot be undone.`,
                   })}><Ban size={13} /></button>
                 </div>
               </div>
@@ -1618,14 +1605,10 @@ function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorr
                   <div style={{ ...numFont, fontWeight: 700, fontSize: 16 }}>{fmt(p.amount)}</div>
                   <div style={{ display: "flex", gap: 2 }}>
                     <button style={{ ...Btn.ghost, padding: "4px 6px" }} onClick={() => setModal({ type: "payment", payload: { existing: p } })}><Edit2 size={13} /></button>
-                    <button style={{ ...Btn.ghost, padding: "4px 6px", color: C.rust }} onClick={() => setModal({
-                      type: "confirmDelete", payload: {
-                        title: "Delete payment", message: `Permanently delete this payment of ${fmt(p.amount)} on ${p.date}? This will increase the loan's outstanding balance. This cannot be undone.`,
-                        onConfirm: () => {
-                          update((d) => { d.payments = d.payments.filter((x) => x.id !== p.id); }, `Deleted payment of ${fmt(p.amount)} on loan ${l.loanNumber}`);
-                          showToast("Payment deleted.");
-                        }
-                      }
+                    <button style={{ ...Btn.ghost, padding: "4px 6px", color: C.rust }} onClick={() => confirmOrRequestDelete({
+                      role, currentUser, update, showToast, setModal,
+                      entityType: "payment", entityId: p.id, entityLabel: `payment of ${fmt(p.amount)} on loan ${l.loanNumber}`,
+                      title: "Delete payment", message: `Permanently delete this payment of ${fmt(p.amount)} on ${p.date}? This will increase the loan's outstanding balance. This cannot be undone.`,
                     })}><Ban size={13} /></button>
                   </div>
                 </div>
@@ -1640,7 +1623,7 @@ function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorr
 
 /* --------------------------------- payments --------------------------------- */
 
-function Payments({ data, update, showToast, goLoan, setModal }) {
+function Payments({ data, update, showToast, goLoan, setModal, role, currentUser }) {
   const list = [...data.payments].sort((a, b) => new Date(b.date) - new Date(a.date));
   return (
     <div>
@@ -1662,14 +1645,10 @@ function Payments({ data, update, showToast, goLoan, setModal }) {
                   <div style={{ ...numFont, fontWeight: 700, fontSize: 17 }}>{fmt(p.amount)}</div>
                   <div style={{ display: "flex", gap: 2 }}>
                     <button style={{ ...Btn.ghost, padding: "5px 7px" }} onClick={() => setModal({ type: "payment", payload: { existing: p } })}><Edit2 size={13} /></button>
-                    <button style={{ ...Btn.ghost, padding: "5px 7px", color: C.rust }} onClick={() => setModal({
-                      type: "confirmDelete", payload: {
-                        title: "Delete payment", message: `Permanently delete this payment of ${fmt(p.amount)}${loan ? ` on loan ${loan.loanNumber}` : ""}? This will increase the loan's outstanding balance. This cannot be undone.`,
-                        onConfirm: () => {
-                          update((d) => { d.payments = d.payments.filter((x) => x.id !== p.id); }, `Deleted payment of ${fmt(p.amount)}${loan ? ` on loan ${loan.loanNumber}` : ""}`);
-                          showToast("Payment deleted.");
-                        }
-                      }
+                    <button style={{ ...Btn.ghost, padding: "5px 7px", color: C.rust }} onClick={() => confirmOrRequestDelete({
+                      role, currentUser, update, showToast, setModal,
+                      entityType: "payment", entityId: p.id, entityLabel: `payment of ${fmt(p.amount)}${loan ? ` on loan ${loan.loanNumber}` : ""}`,
+                      title: "Delete payment", message: `Permanently delete this payment of ${fmt(p.amount)}${loan ? ` on loan ${loan.loanNumber}` : ""}? This will increase the loan's outstanding balance. This cannot be undone.`,
                     })}><Ban size={13} /></button>
                   </div>
                 </div>
@@ -1684,7 +1663,7 @@ function Payments({ data, update, showToast, goLoan, setModal }) {
 
 /* -------------------------------- collateral --------------------------------- */
 
-function Collateral({ data, update, showToast, setModal, goLoan }) {
+function Collateral({ data, update, showToast, setModal, goLoan, role, currentUser }) {
   const list = [...data.collateral].sort((a, b) => new Date(b.dateReceived) - new Date(a.dateReceived));
 
   const markCollected = (c, e) => {
@@ -1722,14 +1701,10 @@ function Collateral({ data, update, showToast, setModal, goLoan }) {
                 </button>
                 <button style={{ ...Btn.ghost, flex: 1, justifyContent: "center", padding: "6px 8px", color: C.rust }} onClick={(e) => {
                   e.stopPropagation();
-                  setModal({
-                    type: "confirmDelete", payload: {
-                      title: "Delete collateral record", message: `Permanently delete "${c.description}" from this loan's collateral? This cannot be undone.`,
-                      onConfirm: () => {
-                        update((d) => { d.collateral = d.collateral.filter((x) => x.id !== c.id); }, `Deleted collateral "${c.description}"`);
-                        showToast("Collateral record deleted.");
-                      }
-                    }
+                  confirmOrRequestDelete({
+                    role, currentUser, update, showToast, setModal,
+                    entityType: "collateral", entityId: c.id, entityLabel: `collateral "${c.description}"`,
+                    title: "Delete collateral record", message: `Permanently delete "${c.description}" from this loan's collateral? This cannot be undone.`,
                   });
                 }}>
                   <Ban size={13} /> Delete
@@ -1745,7 +1720,7 @@ function Collateral({ data, update, showToast, setModal, goLoan }) {
 
 /* --------------------------------- expenses --------------------------------- */
 
-function Expenses({ data, update, showToast, setModal }) {
+function Expenses({ data, update, showToast, setModal, role, currentUser }) {
   const list = [...data.expenses].sort((a, b) => new Date(b.date) - new Date(a.date));
   const total = list.filter(e=>!e.voided).reduce((s, e) => s + Number(e.amount), 0);
   const balances = [...computeDailyCashBalances(data)].reverse();
@@ -1811,14 +1786,10 @@ function Expenses({ data, update, showToast, setModal }) {
                 <div style={{ ...numFont, fontWeight: 700, fontSize: 17 }}>{fmt(e.amount)}</div>
                 <div style={{ display: "flex", gap: 4 }}>
                   <button style={{ ...Btn.ghost, padding: "5px 7px" }} onClick={() => setModal({ type: "expense", payload: e })}><Edit2 size={13} /></button>
-                  <button style={{ ...Btn.ghost, padding: "5px 7px", color: C.rust }} onClick={() => setModal({
-                    type: "confirmDelete", payload: {
-                      title: "Delete expense", message: `Permanently delete the "${e.description}" expense of ${fmt(e.amount)}? This cannot be undone.`,
-                      onConfirm: () => {
-                        update((d) => { d.expenses = d.expenses.filter((x) => x.id !== e.id); }, `Deleted expense "${e.description}" (${fmt(e.amount)})`);
-                        showToast("Expense deleted.");
-                      }
-                    }
+                  <button style={{ ...Btn.ghost, padding: "5px 7px", color: C.rust }} onClick={() => confirmOrRequestDelete({
+                    role, currentUser, update, showToast, setModal,
+                    entityType: "expense", entityId: e.id, entityLabel: `expense "${e.description}"`,
+                    title: "Delete expense", message: `Permanently delete the "${e.description}" expense of ${fmt(e.amount)}? This cannot be undone.`,
                   })}><Ban size={13} /></button>
                 </div>
               </div>
@@ -1832,7 +1803,7 @@ function Expenses({ data, update, showToast, setModal }) {
 
 /* --------------------------------- external funding page --------------------------------- */
 
-function ExternalFunding({ data, setModal, update, showToast }) {
+function ExternalFunding({ data, setModal, update, showToast, role, currentUser }) {
   const [groupBy, setGroupBy] = useState("month");
   const [selectedKey, setSelectedKey] = useState(null);
   const scrollRef = useRef(null);
@@ -1944,13 +1915,13 @@ function ExternalFunding({ data, setModal, update, showToast }) {
           {activeGroup && (
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               <div style={{ fontWeight: 700, fontSize: 14.5, color: C.ink3, textTransform: "uppercase", letterSpacing: 0.4 }}>{activeGroup.label}</div>
-              <FundGroupSection title="External loans received" icon={ArrowDownCircle} tone="forest" setModal={setModal} update={update} showToast={showToast}
+              <FundGroupSection title="External loans received" icon={ArrowDownCircle} tone="forest" setModal={setModal} update={update} showToast={showToast} role={role} currentUser={currentUser}
                 events={activeGroup.events.filter((e) => e.type === "External Loan" && e.kind === "received")} kind="received" />
-              <FundGroupSection title="External loans paid" icon={ArrowUpCircle} tone="rust" setModal={setModal} update={update} showToast={showToast}
+              <FundGroupSection title="External loans paid" icon={ArrowUpCircle} tone="rust" setModal={setModal} update={update} showToast={showToast} role={role} currentUser={currentUser}
                 events={activeGroup.events.filter((e) => e.type === "External Loan" && e.kind === "paid")} kind="paid" />
-              <FundGroupSection title="Money from the bank" icon={ArrowDownCircle} tone="forest" setModal={setModal} update={update} showToast={showToast}
+              <FundGroupSection title="Money from the bank" icon={ArrowDownCircle} tone="forest" setModal={setModal} update={update} showToast={showToast} role={role} currentUser={currentUser}
                 events={activeGroup.events.filter((e) => e.type === "Bank" && e.kind === "received")} kind="received" />
-              <FundGroupSection title="Money from the bank paid" icon={ArrowUpCircle} tone="rust" setModal={setModal} update={update} showToast={showToast}
+              <FundGroupSection title="Money from the bank paid" icon={ArrowUpCircle} tone="rust" setModal={setModal} update={update} showToast={showToast} role={role} currentUser={currentUser}
                 events={activeGroup.events.filter((e) => e.type === "Bank" && e.kind === "paid")} kind="paid" />
             </div>
           )}
@@ -1960,7 +1931,7 @@ function ExternalFunding({ data, setModal, update, showToast }) {
   );
 }
 
-function FundGroupSection({ title, icon: Icon, tone, events, setModal, update, showToast }) {
+function FundGroupSection({ title, icon: Icon, tone, events, setModal, update, showToast, role, currentUser }) {
   const total = events.reduce((s, e) => s + e.amount, 0);
 
   const editEvent = (e) => {
@@ -1970,25 +1941,9 @@ function FundGroupSection({ title, icon: Icon, tone, events, setModal, update, s
 
   const deleteEvent = (e) => {
     if (e.kind === "received") {
-      setModal({
-        type: "confirmDelete", payload: {
-          title: "Delete funding record", message: `Permanently delete the ${fmt(e.amount)} received from "${e.fund.source}"? Any repayments recorded against it will remain but no longer be linked to a source. This cannot be undone.`,
-          onConfirm: () => {
-            update((d) => { d.externalFunds = d.externalFunds.filter((f) => f.id !== e.fund.id); }, `Deleted funding record from "${e.fund.source}" (${fmt(e.amount)})`);
-            showToast("Deleted.");
-          },
-        }
-      });
+      confirmOrRequestDelete({ role, currentUser, update, showToast, setModal, entityType: "fund", entityId: e.fund.id, entityLabel: `funding record from "${e.fund.source}"`, title: "Delete funding record", message: `Permanently delete the ${fmt(e.amount)} received from "${e.fund.source}"? Any repayments recorded against it will remain but no longer be linked to a source. This cannot be undone.` });
     } else {
-      setModal({
-        type: "confirmDelete", payload: {
-          title: "Delete repayment", message: `Permanently delete this repayment of ${fmt(e.amount)} to "${e.fund.source}"? This cannot be undone.`,
-          onConfirm: () => {
-            update((d) => { d.fundRepayments = d.fundRepayments.filter((r) => r.id !== e.repayment.id); }, `Deleted repayment of ${fmt(e.amount)} to "${e.fund.source}"`);
-            showToast("Deleted.");
-          },
-        }
-      });
+      confirmOrRequestDelete({ role, currentUser, update, showToast, setModal, entityType: "fundRepayment", entityId: e.repayment.id, entityLabel: `repayment of ${fmt(e.amount)} to "${e.fund.source}"`, title: "Delete repayment", message: `Permanently delete this repayment of ${fmt(e.amount)} to "${e.fund.source}"? This cannot be undone.` });
     }
   };
 
@@ -2543,6 +2498,57 @@ function LoginScreen({ data, onLogin }) {
   );
 }
 
+function ApprovalsPage({ data, update, showToast, currentUser }) {
+  const requests = [...(data.deletionRequests || [])].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const pending = requests.filter((request) => request.status === "pending");
+  const resolved = requests.filter((request) => request.status !== "pending");
+
+  const approve = (request) => {
+    if (!window.confirm(`Approve this deletion: ${request.entityLabel}? This cannot be undone.`)) return;
+    update((d) => {
+      const current = d.deletionRequests.find((item) => item.id === request.id);
+      if (!current || current.status !== "pending") return;
+      executeDeletionRequest(d, current);
+      current.status = "approved";
+      current.resolvedAt = new Date().toISOString();
+      current.resolvedBy = currentUser.username;
+    }, `Approved deletion request: ${request.entityLabel}`);
+    showToast("Deletion approved and completed.");
+  };
+
+  const reject = (request) => {
+    update((d) => {
+      const current = d.deletionRequests.find((item) => item.id === request.id);
+      if (!current || current.status !== "pending") return;
+      current.status = "rejected";
+      current.resolvedAt = new Date().toISOString();
+      current.resolvedBy = currentUser.username;
+    }, `Rejected deletion request: ${request.entityLabel}`);
+    showToast("Deletion request rejected.");
+  };
+
+  return (
+    <div>
+      <SectionTitle>Approvals</SectionTitle>
+      <div style={{ fontSize: 14.5, color: C.ink3, marginBottom: 18, maxWidth: 620 }}>
+        Non-administrator deletions wait here for approval. Nothing is removed until an administrator approves it.
+      </div>
+      <div style={{ fontWeight: 700, fontSize: 14.5, textTransform: "uppercase", letterSpacing: 0.4, color: C.ink3, marginBottom: 10 }}>Pending {pending.length > 0 && `(${pending.length})`}</div>
+      {pending.length === 0 ? <Card style={{ marginBottom: 24 }}><EmptyState icon={CheckCircle2} title="Nothing waiting for approval" /></Card> : (
+        <Card style={{ padding: 0, overflow: "hidden", marginBottom: 24 }}>
+          {pending.map((request, index) => (
+            <div key={request.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, padding: "14px 18px", borderBottom: index < pending.length - 1 ? `1px solid ${C.border}` : "none" }}>
+              <div><div style={{ fontWeight: 600, fontSize: 16 }}>{request.entityLabel}</div><div style={{ fontSize: 14, color: C.ink3, marginTop: 2 }}>Requested by {request.requestedByName || request.requestedBy} · {request.createdAt.slice(0, 10)}</div></div>
+              <div style={{ display: "flex", gap: 8 }}><button style={Btn.secondary} onClick={() => reject(request)}>Reject</button><button style={Btn.danger} onClick={() => approve(request)}><Trash2 size={13} /> Approve delete</button></div>
+            </div>
+          ))}
+        </Card>
+      )}
+      {resolved.length > 0 && <><div style={{ fontWeight: 700, fontSize: 14.5, textTransform: "uppercase", letterSpacing: 0.4, color: C.ink3, marginBottom: 10 }}>History</div><Card style={{ padding: 0, overflow: "hidden" }}>{resolved.map((request, index) => <div key={request.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 18px", borderBottom: index < resolved.length - 1 ? `1px solid ${C.border}` : "none", opacity: 0.75 }}><div><div style={{ fontWeight: 600, fontSize: 15 }}>{request.entityLabel}</div><div style={{ fontSize: 13.5, color: C.ink3, marginTop: 2 }}>Requested by {request.requestedByName || request.requestedBy} · {request.status} by {request.resolvedBy}</div></div><span style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", padding: "3px 10px", borderRadius: 20, background: request.status === "approved" ? C.rustSoft : C.forestSoft, color: request.status === "approved" ? C.rust : C.forestDark }}>{request.status}</span></div>)}</Card></>}
+    </div>
+  );
+}
+
 function UsersPage({ data, update, showToast, currentUser, setModal }) {
   const users = [...data.users].sort((a, b) => a.username.localeCompare(b.username));
 
@@ -3056,6 +3062,34 @@ function ConfirmModal({ payload, close }) {
   );
 }
 
+
+const canDeleteDirectly = (role) => role?.manageUsers === true;
+
+function executeDeletionRequest(data, request) {
+  const { entityType, entityId } = request;
+  if (entityType === "borrower") {
+    const loanIds = data.loans.filter((loan) => loan.borrowerId === entityId).map((loan) => loan.id);
+    data.payments = data.payments.filter((payment) => !loanIds.includes(payment.loanId));
+    data.collateral = data.collateral.filter((item) => !loanIds.includes(item.loanId));
+    data.loans = data.loans.filter((loan) => loan.borrowerId !== entityId);
+    data.borrowers = data.borrowers.filter((borrower) => borrower.id !== entityId);
+  } else if (entityType === "loan") {
+    data.payments = data.payments.filter((payment) => payment.loanId !== entityId);
+    data.collateral = data.collateral.filter((item) => item.loanId !== entityId);
+    data.loans = data.loans.filter((loan) => loan.id !== entityId);
+  } else if (entityType === "payment") data.payments = data.payments.filter((payment) => payment.id !== entityId);
+  else if (entityType === "collateral") data.collateral = data.collateral.filter((item) => item.id !== entityId);
+  else if (entityType === "expense") data.expenses = data.expenses.filter((expense) => expense.id !== entityId);
+  else if (entityType === "fund") data.externalFunds = data.externalFunds.filter((fund) => fund.id !== entityId);
+  else if (entityType === "fundRepayment") data.fundRepayments = data.fundRepayments.filter((repayment) => repayment.id !== entityId);
+}
+
+function confirmOrRequestDelete({ role, currentUser, update, showToast, setModal, entityType, entityId, entityLabel, title, message, onDeleted }) {
+  const requestPayload = canDeleteDirectly(role)
+    ? { title, message, onConfirm: () => { update((data) => executeDeletionRequest(data, { entityType, entityId }), `Deleted ${entityLabel}`); showToast(`${entityLabel} deleted.`); onDeleted?.(); } }
+    : { title: "Request deletion approval", message: `You do not have permission to delete this directly. ${message} Nothing is deleted until an administrator approves it.`, confirmLabel: "Send request", onConfirm: () => { update((data) => { if (!Array.isArray(data.deletionRequests)) data.deletionRequests = []; data.deletionRequests.push({ id: uid("delreq"), entityType, entityId, entityLabel, requestedBy: currentUser.username, requestedByName: currentUser.fullName, status: "pending", createdAt: new Date().toISOString() }); }, `Requested deletion approval for ${entityLabel}`); showToast("Deletion request sent for approval."); } };
+  setModal({ type: "confirmDelete", payload: requestPayload });
+}
 function ChangePasswordForm({ data, update, showToast, close, currentUser }) {
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -3495,7 +3529,8 @@ function LoanForm({ data, update, showToast, close, payload, goLoan, setModal })
   const [interestType, setInterestType] = useState("Percent");
   const [interestValue, setInterestValue] = useState(String(DEFAULT_INTEREST_RATE));
   const [issueDate, setIssueDate] = useState(todayISO());
-  const [dueDate, setDueDate] = useState("");
+  const [dueDate, setDueDate] = useState(addDays(todayISO(), 30));
+  const [dueDateTouched, setDueDateTouched] = useState(false);
   const [repaymentMethod, setRepaymentMethod] = useState("Full Payment");
   const [instCount, setInstCount] = useState("");
   const [instFreq, setInstFreq] = useState("Monthly");
@@ -3532,6 +3567,10 @@ function LoanForm({ data, update, showToast, close, payload, goLoan, setModal })
 
   const matches = bq ? data.borrowers.filter((b) => b.fullName.toLowerCase().includes(bq.toLowerCase())) : [];
   const selectedBorrower = data.borrowers.find((b) => b.id === borrowerId);
+
+  useEffect(() => {
+    if (!dueDateTouched) setDueDate(addDays(issueDate, 30));
+  }, [issueDate, dueDateTouched]);
 
   const submit = () => {
     if (!borrowerId) return showToast("Please select a borrower first.");
@@ -3673,7 +3712,7 @@ function LoanForm({ data, update, showToast, close, payload, goLoan, setModal })
       <div style={{ fontWeight: 700, fontSize: 14.5, textTransform: "uppercase", letterSpacing: 0.4, color: C.ink3, margin: "16px 0 10px" }}>When it's expected to be paid</div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", columnGap: 14 }}>
         <Field label="Loan issue date" required><DatePicker value={issueDate} onChange={setIssueDate} /></Field>
-        <Field label="Expected payment / due date" required><DatePicker value={dueDate} onChange={setDueDate} /></Field>
+        <Field label="Expected payment / due date" required><DatePicker value={dueDate} onChange={(value) => { setDueDateTouched(true); setDueDate(value); }} /></Field>
       </div>
 
       <Field label="Repayment method">
