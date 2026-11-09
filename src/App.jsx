@@ -32,52 +32,71 @@ const addDays = (dateStr, days) => {
 };
 const uid = (p) => `${p}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
 
-/* -------------------------------- password hashing --------------------------------
-   Passwords are never stored in plain text. Uses the browser/Electron's built-in
-   Web Crypto API (PBKDF2, 100k iterations, SHA-256) with a random salt per user,
-   so no extra native dependency is needed and it works identically whether this
-   runs as a Claude artifact or inside the packaged desktop app. */
+/* -------------------------------- data access --------------------------------
+   All persistence lives in the Electron main process now. The renderer asks
+   for a page of rows, a single record, or an aggregate; it never receives the
+   whole ledger. Password hashing and verification also happen in the main
+   process, so no password material is kept in React state. */
 
-function randomSalt() {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+const api = () => window.ledger;
+const actorOf = (user) => (user ? user.fullName || user.username : "System");
+
+/** Small fetch helper for pages: reruns when any dependency changes. */
+function useServerData(loader, deps) {
+  const [state, setState] = useState({ loading: true, data: null, error: null });
+  useEffect(() => {
+    let alive = true;
+    setState((s) => ({ ...s, loading: true }));
+    Promise.resolve()
+      .then(loader)
+      .then((data) => alive && setState({ loading: false, data, error: null }))
+      .catch((error) => alive && setState({ loading: false, data: null, error }));
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
+  return state;
 }
 
-async function hashPassword(password, salt) {
-  const enc = new TextEncoder();
-  const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
-  const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt: enc.encode(salt), iterations: 100000, hash: "SHA-256" },
-    keyMaterial, 256
+function useDebounced(value, delay = 300) {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+  return debounced;
+}
+
+function Pager({ page, pageCount, total, onPage }) {
+  if (!pageCount || pageCount <= 1) return null;
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginTop: 12, flexWrap: "wrap" }}>
+      <div style={{ fontSize: 13.5, color: C.ink3 }}>
+        Page {page} of {pageCount}
+        {typeof total === "number" ? ` · ${total.toLocaleString()} record${total === 1 ? "" : "s"}` : ""}
+      </div>
+      <div style={{ display: "flex", gap: 6 }}>
+        <button style={{ ...Btn.secondary, padding: "6px 12px", fontSize: 14 }} disabled={page <= 1} onClick={() => onPage(page - 1)}>Previous</button>
+        <button style={{ ...Btn.secondary, padding: "6px 12px", fontSize: 14 }} disabled={page >= pageCount} onClick={() => onPage(page + 1)}>Next</button>
+      </div>
+    </div>
   );
-  return Array.from(new Uint8Array(bits)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function constantTimeEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
+function LoadingCard() {
+  return <Card><div style={{ padding: "18px 0", color: C.ink3, fontSize: 15 }}>Loading…</div></Card>;
 }
 
-async function verifyPassword(password, salt, expectedHash) {
-  if (!salt || !expectedHash) return false;
-  const actual = await hashPassword(password, salt);
-  return constantTimeEqual(actual, expectedHash);
+function ErrorCard({ error }) {
+  return <Card><div style={{ padding: "10px 0", color: C.rust, fontSize: 15 }}>{error?.message || "Something went wrong loading this page."}</div></Card>;
 }
 
-/** Upgrades any user still carrying a plain-text `password` field (from before
- *  hashing was added) to a salted hash, in place. Safe to call repeatedly. */
-async function migrateLegacyPasswords(users) {
-  for (const u of users) {
-    if (u.password && !u.passwordHash) {
-      const salt = randomSalt();
-      u.passwordHash = await hashPassword(u.password, salt);
-      u.passwordSalt = salt;
-      delete u.password;
-    }
-  }
+function usePageState(initial = 1) {
+  const [page, setPage] = useState(initial);
+  return [page, (next) => setPage(Math.max(1, next)), () => setPage(initial)];
 }
+
 
 const formatTime = (isoTimestamp) => {
   if (!isoTimestamp) return "";
@@ -96,8 +115,6 @@ const EXPENSE_CATEGORIES = [
 ];
 const PAYMENT_METHODS = ["Cash", "Mobile Money", "Bank Transfer", "Other"];
 const FREQUENCIES = ["Daily", "Weekly", "Monthly", "Custom"];
-
-const FREQ_DAYS = { Daily: 1, Weekly: 7, Monthly: 30, Custom: 30 };
 
 const PHONE_REGEX = /^(07|03|04)\d{8}$/;
 const digitsOnly = (v) => v.replace(/\D/g, "").slice(0, 10);
@@ -229,37 +246,6 @@ function translate(lang, key) {
   return entry[lang] || entry.en || key;
 }
 
-/* ---------------------------- storage helpers ---------------------------- */
-
-const STORE_KEY = "ledger-data-v1";
-
-async function loadAll() {
-  try {
-    const res = await window.storage.get(STORE_KEY, false);
-    if (res && res.value) return JSON.parse(res.value);
-  } catch (e) { /* first run, nothing stored yet */ }
-  return null;
-}
-async function saveAll(data) {
-  try {
-    await window.storage.set(STORE_KEY, JSON.stringify(data), false);
-  } catch (e) { console.error("Save failed", e); }
-}
-
-const seedData = () => ({
-  borrowers: [],
-  loans: [],
-  payments: [],
-  collateral: [],
-  expenses: [],
-  externalFunds: [],
-  fundRepayments: [],
-  auditLog: [],
-  deletionRequests: [],
-  users: [],
-  settings: { businessName: "My Lending Business", language: "en", startingCashBalance: 0 }
-});
-
 /* -------------------------------- roles & access -------------------------------- */
 
 const ROLES = {
@@ -298,10 +284,20 @@ const ROLE_NAMES = Object.keys(ROLES);
 
 /* --------------------------------- app ----------------------------------- */
 
+const SESSION_KEY = "ledger.currentUser";
+
 export default function App() {
-  const [data, setData] = useState(null);
+  const [boot, setBoot] = useState(null);
   const [loaded, setLoaded] = useState(false);
-  const [currentUser, setCurrentUser] = useState(null);
+  const [bootError, setBootError] = useState(null);
+  const [currentUser, setCurrentUser] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(SESSION_KEY));
+      return saved && saved.id ? saved : null;
+    } catch (e) {
+      return null;
+    }
+  });
   const [page, setPage] = useState("dashboard");
   const [navOpen, setNavOpen] = useState(false);
   const [searchQ, setSearchQ] = useState("");
@@ -309,98 +305,64 @@ export default function App() {
   const [focusLoanId, setFocusLoanId] = useState(null);
   const [modal, setModal] = useState(null); // {type, payload}
   const [toast, setToast] = useState(null);
-
-  useEffect(() => {
-    (async () => {
-      const d = await loadAll();
-      const base = d || seedData();
-
-      // Defensively backfill every top-level key against seedData()'s
-      // shape, so a data file saved by an older version of the app (which
-      // may predate features added since) loads safely instead of
-      // crashing on a field that doesn't exist yet, no matter how many
-      // versions behind it is.
-      if (!Array.isArray(base.borrowers)) base.borrowers = [];
-      if (!Array.isArray(base.loans)) base.loans = [];
-      if (!Array.isArray(base.payments)) base.payments = [];
-      if (!Array.isArray(base.collateral)) base.collateral = [];
-      if (!Array.isArray(base.expenses)) base.expenses = [];
-      if (!Array.isArray(base.externalFunds)) base.externalFunds = [];
-      if (!Array.isArray(base.fundRepayments)) base.fundRepayments = [];
-      if (!Array.isArray(base.auditLog)) base.auditLog = [];
-      if (!Array.isArray(base.deletionRequests)) base.deletionRequests = [];
-      if (!base.settings) base.settings = {};
-      if (!base.settings.businessName) base.settings.businessName = "My Lending Business";
-      if (!base.settings.language) base.settings.language = "en";
-      if (base.settings.startingCashBalance === undefined) base.settings.startingCashBalance = 0;
-
-      if (!base.users || base.users.length === 0) {
-        const salt = randomSalt();
-        const hash = await hashPassword("admin", salt);
-        base.users = [{ id: uid("usr"), username: "admin", passwordHash: hash, passwordSalt: salt, fullName: "Administrator", role: "Administrator", active: true, createdAt: todayISO() }];
-      } else {
-        await migrateLegacyPasswords(base.users);
-      }
-
-      setData(base);
-      setLoaded(true);
-    })();
-  }, []);
-
-  useEffect(() => {
-    if (loaded && data) saveAll(data);
-  }, [data, loaded]);
+  const [version, setVersion] = useState(0);
+  const [showNotifications, setShowNotifications] = useState(false);
 
   const showToast = useCallback((msg) => {
     setToast(msg);
     setTimeout(() => setToast(null), 2600);
   }, []);
 
-  // Automatically renew any loan that has passed its due date and hasn't
-  // been paid off, voided, or renewed already. Runs on load and whenever
-  // the books change, so a loan is rolled over as soon as it's noticed overdue.
-  useEffect(() => {
-    if (!loaded || !data) return;
-    const toRenew = data.loans.filter((l) => !l.voided && !l.renewed && loanStatus(l, data.payments) === "Overdue");
-    if (toRenew.length === 0) return;
-    setData((prev) => {
-      const next = structuredClone(prev);
-      if (!next.auditLog) next.auditLog = [];
-      toRenew.forEach((l) => {
-        const fresh = next.loans.find((x) => x.id === l.id);
-        if (!fresh || fresh.voided || fresh.renewed) return;
-        const term = Math.max(daysBetween(fresh.issueDate, fresh.dueDate), 7);
-        const newDue = new Date();
-        newDue.setDate(newDue.getDate() + term);
-        const newId = renewLoan(next, fresh.id, { newDueDate: newDue.toISOString().slice(0, 10), auto: true });
-        next.auditLog.push({
-          id: uid("log"), timestamp: new Date().toISOString(), username: "System (auto-renewal)",
-          action: `Automatically renewed overdue loan ${fresh.loanNumber} into ${next.loans.find((x) => x.id === newId)?.loanNumber || "a new loan"}`,
-        });
-      });
-      return next;
-    });
-    showToast(`${toRenew.length} overdue loan${toRenew.length > 1 ? "s" : ""} automatically renewed.`);
-  }, [loaded, data]);
+  const refresh = useCallback(() => setVersion((v) => v + 1), []);
 
-  // Pop up an alert summary once per login, covering anything overdue,
-  // due soon, or that was just rolled over automatically.
-  const [showNotifications, setShowNotifications] = useState(false);
+  const loadBootstrap = useCallback(async () => {
+    let b = await api().bootstrap();
+    // Roll over overdue loans as soon as the app opens, same as before, but
+    // let the main process do it in bounded batches instead of cloning the
+    // entire dataset in the renderer.
+    if (b.counts && b.counts.overdue > 0) {
+      try {
+        const result = await api().autoRenew(5000);
+        if (result.renewed > 0) {
+          b = await api().bootstrap();
+          showToast(`${result.renewed} overdue loan${result.renewed === 1 ? "" : "s"} automatically renewed.`);
+        }
+        if (result.remaining > 0) {
+          b = { ...b, autoRenewRemaining: result.remaining };
+        }
+      } catch (e) {
+        console.error("Automatic renewal failed:", e);
+      }
+    }
+    setBoot(b);
+    setBootError(null);
+    setLoaded(true);
+    return b;
+  }, [showToast]);
+
+  useEffect(() => {
+    loadBootstrap().catch((error) => {
+      setBootError(error);
+      setLoaded(true);
+    });
+  }, [loadBootstrap]);
+
+  useEffect(() => {
+    if (version > 0) {
+      loadBootstrap().catch((error) => setBootError(error));
+    }
+  }, [version, loadBootstrap]);
+
   const notifShownRef = useRef(false);
   useEffect(() => {
-    if (!loaded || !data || !currentUser) return;
-    if (notifShownRef.current) return;
+    if (!loaded || !boot || !currentUser || notifShownRef.current) return;
     notifShownRef.current = true;
-    const today = todayISO();
-    const overdue = data.loans.filter((l) => !l.voided && !l.renewed && loanStatus(l, data.payments) === "Overdue");
-    const soon = data.loans.filter((l) => !l.voided && !l.renewed && loanStatus(l, data.payments) === "Active" && daysBetween(today, l.dueDate) >= 0 && daysBetween(today, l.dueDate) <= 3);
-    const autoRenewedToday = data.loans.filter((l) => l.autoRenewed && l.issuedAt && l.issuedAt.slice(0, 10) === today);
-    if (overdue.length > 0 || soon.length > 0 || autoRenewedToday.length > 0) {
-      setShowNotifications(true);
-    }
-  }, [loaded, data, currentUser]);
+    const a = boot.alerts || {};
+    const count = (a.overdue?.length || 0) + (a.soon?.length || 0) + (a.autoRenewedToday?.length || 0);
+    if (count > 0) setShowNotifications(true);
+  }, [loaded, boot, currentUser]);
 
-  if (!loaded || !data) {
+  if (!loaded) {
     return (
       <div style={{ ...S.page, display: "flex", alignItems: "center", justifyContent: "center", height: "100%", minHeight: 480 }}>
         <style>{FONT_IMPORT}</style>
@@ -409,39 +371,31 @@ export default function App() {
     );
   }
 
-  const update = (fn, logLabel) => setData((prev) => {
-    const next = structuredClone(prev);
-    fn(next);
-    if (logLabel) {
-      if (!next.auditLog) next.auditLog = [];
-      next.auditLog.push({
-        id: uid("log"), timestamp: new Date().toISOString(),
-        username: currentUser ? (currentUser.fullName || currentUser.username) : "System",
-        action: logLabel,
-      });
-    }
-    return next;
-  });
+  if (bootError && !boot) {
+    return (
+      <div style={{ ...S.page, display: "flex", alignItems: "center", justifyContent: "center", height: "100%", minHeight: 480, padding: 24 }}>
+        <Card style={{ maxWidth: 560 }}>
+          <div style={{ ...displayFont, fontSize: 22, fontWeight: 600, marginBottom: 8 }}>The ledger could not be opened</div>
+          <div style={{ fontSize: 15, color: C.ink2, lineHeight: 1.6 }}>{bootError.message || String(bootError)}</div>
+        </Card>
+      </div>
+    );
+  }
 
   if (!currentUser) {
-    const handleLogin = (u) => {
-      setData((prev) => {
-        const next = structuredClone(prev);
-        if (!next.auditLog) next.auditLog = [];
-        next.auditLog.push({
-          id: uid("log"), timestamp: new Date().toISOString(),
-          username: u.fullName || u.username, action: "Signed in",
-        });
-        return next;
-      });
-      setCurrentUser(u);
+    const handleLogin = (user) => {
+      localStorage.setItem(SESSION_KEY, JSON.stringify(user));
+      setCurrentUser(user);
+      setPage("dashboard");
+      notifShownRef.current = false;
+      refresh();
     };
-    return <LoginScreen data={data} onLogin={handleLogin} />;
+    return <LoginScreen businessName={boot?.settings?.businessName} onLogin={handleLogin} />;
   }
 
   const role = ROLES[currentUser.role] || ROLES.Viewer;
   const allowedPages = role.pages;
-  const t = (key) => translate(data.settings.language || "en", key);
+  const t = (key) => translate(boot?.settings?.language || "en", key);
 
   const goBorrower = (id) => {
     if (!allowedPages.includes("borrowers")) return;
@@ -452,13 +406,24 @@ export default function App() {
     setFocusLoanId(id); setPage("loan-detail");
   };
 
-  const ctx = { data, update, showToast, goBorrower, goLoan, setModal, setPage, currentUser, role, t };
+  const logout = async () => {
+    try {
+      await api().auth.logout({ actor: actorOf(currentUser) });
+    } catch (e) {
+      /* logging out should always work, even if audit logging fails */
+    }
+    localStorage.removeItem(SESSION_KEY);
+    notifShownRef.current = false;
+    setCurrentUser(null);
+    setPage("dashboard");
+    setShowNotifications(false);
+  };
 
-  const today = todayISO();
-  const overdueLoans = data.loans.filter((l) => !l.voided && !l.renewed && loanStatus(l, data.payments) === "Overdue");
-  const soonLoans = data.loans.filter((l) => !l.voided && !l.renewed && loanStatus(l, data.payments) === "Active" && daysBetween(today, l.dueDate) >= 0 && daysBetween(today, l.dueDate) <= 3);
-  const autoRenewedToday = data.loans.filter((l) => l.autoRenewed && l.issuedAt && l.issuedAt.slice(0, 10) === today);
-  const alertCount = overdueLoans.length + soonLoans.length + autoRenewedToday.length;
+  const ctx = {
+    boot, update: refresh, refresh, showToast, goBorrower, goLoan, setModal, setPage,
+    currentUser, role, t, version, actor: actorOf(currentUser),
+    alertCount: boot?.alertCount || 0,
+  };
 
   const safePage = (allowedPages.includes(page) || (page === "borrower-detail" && allowedPages.includes("borrowers")) || (page === "loan-detail" && allowedPages.includes("loans"))) ? page : "dashboard";
 
@@ -481,25 +446,32 @@ export default function App() {
         }
       `}</style>
 
-      <Sidebar page={safePage} setPage={setPage} navOpen={navOpen} setNavOpen={setNavOpen} businessName={data.settings.businessName} allowedPages={allowedPages} />
+      <Sidebar page={safePage} setPage={setPage} navOpen={navOpen} setNavOpen={setNavOpen} businessName={boot?.settings?.businessName || "My Lending Business"} allowedPages={allowedPages} />
       {navOpen && <div onClick={() => setNavOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(31,42,36,0.4)", zIndex: 30 }} />}
 
       <div className="lm-main" style={{ marginLeft: 240, minHeight: "100%" }}>
         <TopBar
           searchQ={searchQ} setSearchQ={setSearchQ}
           onOpenNav={() => setNavOpen(true)}
-          onQuickAction={(t) => setModal({ type: t })}
+          onQuickAction={(type) => setModal({ type })}
           currentUser={currentUser}
-          onLogout={() => { update(() => {}, "Signed out"); notifShownRef.current = false; setCurrentUser(null); setPage("dashboard"); }}
+          onLogout={logout}
           allowedPages={allowedPages}
-          alertCount={alertCount}
+          alertCount={boot?.alertCount || 0}
           onOpenNotifications={() => setShowNotifications(true)}
           setModal={setModal}
         />
 
         <div style={{ padding: "20px 24px 60px", maxWidth: 1180, margin: "0 auto" }}>
+          {boot?.migrationError && (
+            <Card style={{ marginBottom: 16, background: C.rustSoft, border: "1px solid #E3C3BB" }}>
+              <div style={{ fontSize: 14.5, color: C.rust }}>
+                <b>Some old data could not be imported.</b> {boot.migrationError}. The original store file has been left untouched in the app's data folder.
+              </div>
+            </Card>
+          )}
           {searchQ.trim().length > 0 ? (
-            <SearchResults q={searchQ} data={data} goBorrower={goBorrower} goLoan={goLoan} clear={() => setSearchQ("")} />
+            <SearchResults q={searchQ} goBorrower={goBorrower} goLoan={goLoan} clear={() => setSearchQ("")} version={version} />
           ) : (
             <>
               {safePage === "dashboard" && <Dashboard {...ctx} />}
@@ -527,8 +499,11 @@ export default function App() {
 
       {showNotifications && (
         <NotificationsModal
-          overdueLoans={overdueLoans} soonLoans={soonLoans} autoRenewedToday={autoRenewedToday}
-          data={data} close={() => setShowNotifications(false)} goLoan={goLoan}
+          overdueLoans={boot?.alerts?.overdue || []}
+          soonLoans={boot?.alerts?.soon || []}
+          autoRenewedToday={boot?.alerts?.autoRenewedToday || []}
+          close={() => setShowNotifications(false)}
+          goLoan={goLoan}
         />
       )}
 
@@ -759,137 +734,8 @@ const Btn = {
 
 /* -------------------------------- helpers ---------------------------------- */
 
-function paidAmountFor(loanId, payments) {
-  return payments.filter((p) => p.loanId === loanId && !p.voided).reduce((s, p) => s + Number(p.amount), 0);
-}
-function principalPaidFor(loanId, payments) {
-  return payments.filter((p) => p.loanId === loanId && !p.voided)
-    .reduce((s, p) => s + Number(p.principalPaid ?? p.amount), 0);
-}
-function interestPaidFor(loanId, payments) {
-  return payments.filter((p) => p.loanId === loanId && !p.voided)
-    .reduce((s, p) => s + Number(p.interestPaid ?? 0), 0);
-}
-function loanInterestAmount(loan) {
-  return loan.interestType === "Percent" ? Number(loan.amount) * (Number(loan.interestValue) || 0) / 100 : (Number(loan.interestValue) || 0);
-}
-function loanStatus(loan, payments) {
-  if (loan.voided) return "Voided";
-  if (loan.renewed) return "Renewed";
-  const paid = paidAmountFor(loan.id, payments);
-  if (paid >= loan.totalPayable - 0.5) return "Fully Paid";
-  if (new Date(loan.dueDate) < new Date(todayISO())) return "Overdue";
-  return "Active";
-}
-function nextDueDate(loan, payments) {
-  if (loan.repaymentMethod !== "Instalments" || !loan.instalments) return loan.dueDate;
-  const paidCount = payments.filter((p) => p.loanId === loan.id && !p.voided).length;
-  const step = FREQ_DAYS[loan.instalments.frequency] || 30;
-  const d = new Date(loan.instalments.firstPaymentDate);
-  d.setDate(d.getDate() + paidCount * step);
-  return d.toISOString().slice(0, 10);
-}
-function borrowerName(borrowers, id) {
-  const b = borrowers.find((x) => x.id === id);
-  return b ? b.fullName : "Unknown borrower";
-}
-function loanTotals(loans, payments) {
-  const nonVoided = loans.filter((l) => !l.voided);
-  const totalLent = nonVoided.reduce((s, l) => s + Number(l.amount), 0);
-  const totalCollected = payments.filter((p) => !p.voided).reduce((s, p) => s + Number(p.amount), 0);
-  let outstanding = 0, activeCount = 0, overdueCount = 0;
-  nonVoided.filter((l) => !l.renewed).forEach((l) => {
-    const st = loanStatus(l, payments);
-    if (st !== "Fully Paid") {
-      outstanding += Math.max(0, l.totalPayable - paidAmountFor(l.id, payments));
-      activeCount++;
-      if (st === "Overdue") overdueCount++;
-    }
-  });
-  return { totalLent, totalCollected, outstanding, activeCount, overdueCount };
-}
-
-/** Builds a chronological day-by-day cash ledger: every loan disbursed is
- *  cash out, every payment received is cash in, every expense is cash out.
- *  Renewals don't move new cash, so they're excluded. Returned in ascending
- *  date order, running from the business's starting cash balance. */
-function computeDailyCashBalances(data) {
-  const dayMap = {};
-  const touch = (date) => { if (!dayMap[date]) dayMap[date] = { in: 0, out: 0 }; return dayMap[date]; };
-
-  data.loans.forEach((l) => {
-    if (l.voided || l.renewedFromId) return;
-    touch(l.issueDate).out += Number(l.amount);
-  });
-  data.payments.forEach((p) => {
-    if (p.voided) return;
-    touch(p.date).in += Number(p.amount);
-  });
-  data.expenses.forEach((e) => {
-    if (e.voided) return;
-    touch(e.date).out += Number(e.amount);
-  });
-
-  const days = Object.keys(dayMap).sort();
-  let running = Number(data.settings.startingCashBalance) || 0;
-  return days.map((date) => {
-    const { in: cashIn, out: cashOut } = dayMap[date];
-    const opening = running;
-    const closing = opening + cashIn - cashOut;
-    running = closing;
-    return { date, opening, cashIn, cashOut, closing };
-  });
-}
-
 const DEFAULT_INTEREST_RATE = 20;
 const DEFAULT_PAPERWORK_FEE = 5000;
-
-/** Rolls a loan's outstanding balance into a brand new loan, and marks the
- *  original as Renewed (kept in history, excluded from active totals). */
-function renewLoan(d, oldLoanId, opts = {}) {
-  const old = d.loans.find((l) => l.id === oldLoanId);
-  if (!old || old.voided || old.renewed) return null;
-  const paid = paidAmountFor(old.id, d.payments);
-  const outstanding = Math.max(0, old.totalPayable - paid);
-  const principal = opts.newPrincipal != null && opts.newPrincipal > 0 ? opts.newPrincipal : outstanding;
-  const interestType = opts.interestType || "Percent";
-  const interestValue = opts.interestValue != null ? opts.interestValue : DEFAULT_INTEREST_RATE;
-  const paperworkFee = opts.paperworkFee || 0;
-  const interestAmt = interestType === "Percent" ? principal * interestValue / 100 : interestValue;
-  const totalPayable = principal + interestAmt + paperworkFee;
-  const count = (d.loans.filter((l) => l.loanNumber?.startsWith(`LN-${new Date().getFullYear()}`)).length) + 1;
-  const loanNumber = `LN-${new Date().getFullYear()}-${String(count).padStart(4, "0")}`;
-  const id = uid("loan");
-  const issueDate = todayISO();
-  d.loans.push({
-    id, loanNumber, borrowerId: old.borrowerId, amount: principal, interestType, interestValue,
-    paperworkFee, totalPayable, issueDate, dueDate: opts.newDueDate, repaymentMethod: "Full Payment",
-    instalments: null, voided: false, renewedFromId: old.id, autoRenewed: !!opts.auto,
-    issuedAt: new Date().toISOString(),
-  });
-  old.renewed = true;
-  old.renewedIntoId = id;
-  old.renewedAt = todayISO();
-  return id;
-}
-
-/** Records a payment for whatever remains on a loan, closing it out in one step. */
-function markLoanPaidInData(d, loanId) {
-  const loan = d.loans.find((l) => l.id === loanId);
-  if (!loan) return false;
-  const paid = paidAmountFor(loan.id, d.payments);
-  const outstanding = Math.max(0, loan.totalPayable - paid);
-  if (outstanding <= 0) return false;
-  const remainingPrincipal = Math.max(0, loan.amount - principalPaidFor(loan.id, d.payments));
-  const principalPaid = Math.min(remainingPrincipal, outstanding);
-  const interestPaid = outstanding - principalPaid;
-  d.payments.push({
-    id: uid("pay"), loanId: loan.id, borrowerId: loan.borrowerId, amount: outstanding,
-    principalPaid, interestPaid,
-    date: todayISO(), method: "Cash", reference: "", notes: "Marked as fully paid by admin.", voided: false,
-  });
-  return true;
-}
 
 function StampBadge({ status }) {
   const map = {
@@ -939,19 +785,14 @@ function EmptyState({ icon: Icon, title, sub, action }) {
 
 /* -------------------------------- dashboard -------------------------------- */
 
-function Dashboard({ data, goBorrower, goLoan, setModal, setPage }) {
-  const { borrowers, loans, payments, expenses } = data;
-  const totals = loanTotals(loans, payments);
-  const totalCosts = expenses.filter((e) => !e.voided).reduce((s, e) => s + Number(e.amount), 0);
-  const income = totals.totalCollected - totals.totalLent; // cash-basis estimate
-  const netPosition = income - totalCosts;
+function Dashboard({ goBorrower, goLoan, setModal, setPage, version }) {
+  const { loading, data, error } = useServerData(() => api().dashboard(), [version]);
+  if (loading && !data) return <LoadingCard />;
+  if (error) return <ErrorCard error={error} />;
+  if (!data) return null;
 
-  const today = todayISO();
-  const dueToday = loans.filter((l) => !l.voided && !l.renewed && loanStatus(l, payments) !== "Fully Paid" && nextDueDate(l, payments) === today);
-  const overdue = loans.filter((l) => !l.voided && !l.renewed && loanStatus(l, payments) === "Overdue")
-    .sort((a, b) => daysBetween(b.dueDate, today) - daysBetween(a.dueDate, today));
-  const recentPayments = [...payments].filter(p=>!p.voided).sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 5);
-  const recentLoans = [...loans].filter(l=>!l.voided).sort((a, b) => new Date(b.issueDate) - new Date(a.issueDate)).slice(0, 5);
+  const { totals, totalCosts, dueToday, overdue, recentPayments, recentLoans } = data;
+  const netPosition = totals.totalCollected - totals.totalLent - totalCosts;
 
   const cards = [
     { label: "Total money lent", value: fmt(totals.totalLent), icon: Wallet, tone: "forest" },
@@ -1009,8 +850,8 @@ function Dashboard({ data, goBorrower, goLoan, setModal, setPage }) {
           {dueToday.length === 0 ? <div style={{ fontSize: 15.5, color: C.ink3 }}>Nothing due today.</div> :
             dueToday.map((l) => (
               <AlertRow key={l.id} onClick={() => goLoan(l.id)}
-                title={borrowerName(borrowers, l.borrowerId)}
-                sub={`${l.loanNumber} · ${fmt(l.totalPayable - paidAmountFor(l.id, payments))} remaining`} />
+                title={l.borrowerName}
+                sub={`${l.loanNumber} · ${fmt(l.remaining)} remaining`} />
             ))}
         </Card>
         <Card>
@@ -1021,8 +862,8 @@ function Dashboard({ data, goBorrower, goLoan, setModal, setPage }) {
           {overdue.length === 0 ? <div style={{ fontSize: 15.5, color: C.ink3 }}>No overdue loans. Well kept.</div> :
             overdue.slice(0, 6).map((l) => (
               <AlertRow key={l.id} onClick={() => goLoan(l.id)} danger
-                title={borrowerName(borrowers, l.borrowerId)}
-                sub={`${l.loanNumber} · ${daysBetween(l.dueDate, today)} days overdue`} />
+                title={l.borrowerName}
+                sub={`${l.loanNumber} · ${daysBetween(l.dueDate, todayISO())} days overdue`} />
             ))}
         </Card>
         <Card>
@@ -1033,7 +874,7 @@ function Dashboard({ data, goBorrower, goLoan, setModal, setPage }) {
           {recentPayments.length === 0 ? <div style={{ fontSize: 15.5, color: C.ink3 }}>No payments recorded yet.</div> :
             recentPayments.map((p) => (
               <AlertRow key={p.id} onClick={() => goLoan(p.loanId)}
-                title={borrowerName(borrowers, p.borrowerId)}
+                title={p.borrowerName}
                 sub={`${fmt(p.amount)} · ${p.date}`} />
             ))}
         </Card>
@@ -1045,7 +886,7 @@ function Dashboard({ data, goBorrower, goLoan, setModal, setPage }) {
           {recentLoans.length === 0 ? <div style={{ fontSize: 15.5, color: C.ink3 }}>No loans yet.</div> :
             recentLoans.map((l) => (
               <AlertRow key={l.id} onClick={() => goLoan(l.id)}
-                title={borrowerName(borrowers, l.borrowerId)}
+                title={l.borrowerName}
                 sub={`${l.loanNumber} · ${fmt(l.amount)}`} />
             ))}
         </Card>
@@ -1071,11 +912,17 @@ function AlertRow({ title, sub, onClick, danger }) {
 
 /* -------------------------------- borrowers -------------------------------- */
 
-function Borrowers({ data, goBorrower, setModal, t }) {
+function Borrowers({ goBorrower, setModal, t, version }) {
   const [q, setQ] = useState("");
-  const list = data.borrowers.filter((b) =>
-    !q || [b.fullName, b.phone, b.nationalId].join(" ").toLowerCase().includes(q.toLowerCase())
-  ).sort((a, b) => a.fullName.localeCompare(b.fullName));
+  const search = useDebounced(q, 250);
+  const [page, setPage] = usePageState();
+  const { loading, data, error } = useServerData(
+    () => api().borrowers.page({ page, q: search, limit: 50 }),
+    [page, search, version]
+  );
+  useEffect(() => { setPage(1); }, [search]);
+
+  const list = data?.items || [];
 
   return (
     <div>
@@ -1084,14 +931,12 @@ function Borrowers({ data, goBorrower, setModal, t }) {
       </SectionTitle>
       <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter by name, phone, or national ID…"
         style={{ ...FieldStyle.input, marginBottom: 14, maxWidth: 380 }} />
-      {list.length === 0 ? (
-        <Card><EmptyState icon={Users} title="No borrowers yet" sub="Register your first borrower to get started." action={<button style={Btn.primary} onClick={() => setModal({ type: "borrower" })}><Plus size={15} /> New Borrower</button>} /></Card>
+      {loading && !data ? <LoadingCard /> : error ? <ErrorCard error={error} /> : list.length === 0 ? (
+        <Card><EmptyState icon={Users} title="No borrowers yet" sub={search ? "No one matches that search." : "Register your first borrower to get started."} action={<button style={Btn.primary} onClick={() => setModal({ type: "borrower" })}><Plus size={15} /> New Borrower</button>} /></Card>
       ) : (
-        <Card style={{ padding: 0, overflow: "hidden" }}>
-          {list.map((b, i) => {
-            const loans = data.loans.filter((l) => l.borrowerId === b.id && !l.voided);
-            const outstanding = loans.reduce((s, l) => s + Math.max(0, l.totalPayable - paidAmountFor(l.id, data.payments)), 0);
-            return (
+        <>
+          <Card style={{ padding: 0, overflow: "hidden" }}>
+            {list.map((b, i) => (
               <div key={b.id} onClick={() => goBorrower(b.id)} style={{
                 display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 18px",
                 borderBottom: i < list.length - 1 ? `1px solid ${C.border}` : "none", cursor: "pointer"
@@ -1102,30 +947,56 @@ function Borrowers({ data, goBorrower, setModal, t }) {
                   <div style={{ fontWeight: 600, fontSize: 17 }}>{b.fullName}</div>
                   <div style={{ fontSize: 14.5, color: C.ink3, display: "flex", gap: 12, marginTop: 2 }}>
                     <span><Phone size={11} style={{ verticalAlign: -1 }} /> {b.phone || t("notProvided")}</span>
-                    <span>{loans.length} loan{loans.length !== 1 ? "s" : ""}</span>
+                    <span>{b.loanCount || 0} loan{(b.loanCount || 0) !== 1 ? "s" : ""}</span>
                   </div>
                 </div>
                 <div style={{ textAlign: "right" }}>
-                  <div style={{ ...numFont, fontWeight: 600, fontSize: 16, color: outstanding > 0 ? C.rust : C.ink3 }}>{fmt(outstanding)}</div>
+                  <div style={{ ...numFont, fontWeight: 600, fontSize: 16, color: (b.outstanding || 0) > 0 ? C.rust : C.ink3 }}>{fmt(b.outstanding || 0)}</div>
                   <div style={{ fontSize: 13, color: C.ink4 }}>outstanding</div>
                 </div>
               </div>
-            );
-          })}
-        </Card>
+            ))}
+          </Card>
+          <Pager page={data.page} pageCount={data.pageCount} total={data.total} onPage={setPage} />
+        </>
       )}
     </div>
   );
 }
 
-function BorrowerDetail({ data, borrowerId, setPage, goLoan, setModal, t, update, showToast, role, currentUser }) {
-  const b = data.borrowers.find((x) => x.id === borrowerId);
-  if (!b) return <EmptyState icon={Users} title="Borrower not found" />;
-  const loans = data.loans.filter((l) => l.borrowerId === b.id);
-  const payments = data.payments.filter((p) => p.borrowerId === b.id && !p.voided);
-  const collateral = data.collateral.filter((c) => c.borrowerId === b.id);
-  const outstanding = loans.filter(l=>!l.voided && !l.renewed).reduce((s, l) => s + Math.max(0, l.totalPayable - paidAmountFor(l.id, data.payments)), 0);
-  const outstandingNoInterest = loans.filter(l=>!l.voided && !l.renewed).reduce((s, l) => s + Math.max(0, l.amount - principalPaidFor(l.id, data.payments)), 0);
+function BorrowerDetail({ borrowerId, setPage, goLoan, setModal, t, update, showToast, role, currentUser, actor, boot, version }) {
+  const [loanPage, setLoanPage] = usePageState();
+  useEffect(() => { setLoanPage(1); }, [borrowerId]);
+  const { loading, data, error } = useServerData(
+    () => api().borrowers.get({ id: borrowerId, loanPage, loanLimit: 50 }),
+    [borrowerId, loanPage, version]
+  );
+  if (loading && !data) return <LoadingCard />;
+  if (error) return <ErrorCard error={error} />;
+  if (!data) return <EmptyState icon={Users} title="Borrower not found" />;
+
+  const { borrower: b, summary, loans, collateral } = data;
+  const outstanding = summary.outstanding;
+  const outstandingNoInterest = summary.outstandingNoInterest;
+
+  const markPaid = async (l) => {
+    if (!window.confirm(`Mark ${l.loanNumber} as fully paid? This records a payment of ${fmt(l.outstanding)} to close it out.`)) return;
+    const result = await api().loans.markPaid({ actor, id: l.id });
+    if (!result?.ok) return showToast(result?.error || "Could not mark this loan as paid.");
+    showToast("Loan marked as fully paid.");
+    update();
+  };
+
+  const exportBorrower = async (kind) => {
+    try {
+      const statement = await api().borrowers.statement({ id: b.id });
+      if (!statement) return;
+      if (kind === "print") printHTMLAsPDF(borrowerRecordHTML(boot?.settings?.businessName || "Ledger", statement));
+      else downloadBorrowerRecordCSV(boot?.settings?.businessName || "Ledger", statement);
+    } catch (e) {
+      showToast(e.message || "Could not build that file.");
+    }
+  };
 
   return (
     <div>
@@ -1133,18 +1004,18 @@ function BorrowerDetail({ data, borrowerId, setPage, goLoan, setModal, t, update
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 12, margin: "10px 0 16px" }}>
         <div>
           <h1 style={{ ...displayFont, fontSize: 28, margin: 0, fontWeight: 600 }}>{b.fullName}</h1>
-          <div style={{ color: C.ink3, fontSize: 15, marginTop: 4 }}>Registered {b.dateRegistered} · {loans.length} loan{loans.length !== 1 ? "s" : ""} on record</div>
+          <div style={{ color: C.ink3, fontSize: 15, marginTop: 4 }}>Registered {b.dateRegistered} · {summary.loanCount} loan{summary.loanCount !== 1 ? "s" : ""} on record</div>
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button style={Btn.secondary} onClick={() => printHTMLAsPDF(borrowerRecordHTML(data, b))}><FileType size={13} /> Print</button>
-          <button style={Btn.secondary} onClick={() => downloadBorrowerRecordCSV(data, b)}><Download size={13} /> Download CSV</button>
+          <button style={Btn.secondary} onClick={() => exportBorrower("print")}><FileType size={13} /> Print</button>
+          <button style={Btn.secondary} onClick={() => exportBorrower("csv")}><Download size={13} /> Download CSV</button>
           <button style={Btn.secondary} onClick={() => setModal({ type: "borrower", payload: b })}><Edit2 size={13} /> Edit profile</button>
           <button style={Btn.primary} onClick={() => setModal({ type: "loan", payload: { borrowerId: b.id } })}><Plus size={13} /> New loan</button>
           <button style={Btn.danger} onClick={() => confirmOrRequestDelete({
-            role, currentUser, update, showToast, setModal,
+            role, currentUser, update, showToast, setModal, actor,
             entityType: "borrower", entityId: b.id, entityLabel: `borrower "${b.fullName}"`,
             title: "Delete borrower permanently",
-            message: `Permanently delete "${b.fullName}"? This will also delete their ${loans.length} loan${loans.length !== 1 ? "s" : ""}, ${payments.length} payment${payments.length !== 1 ? "s" : ""}, and ${collateral.length} collateral record${collateral.length !== 1 ? "s" : ""}. This cannot be undone.`,
+            message: `Permanently delete "${b.fullName}"? This will also delete their ${summary.loanCount} loan${summary.loanCount !== 1 ? "s" : ""}, ${summary.paymentCount} payment${summary.paymentCount !== 1 ? "s" : ""}, and ${summary.collateralCount} collateral record${summary.collateralCount !== 1 ? "s" : ""}. This cannot be undone.`,
             onDeleted: () => setPage("borrowers"),
           })}><Ban size={13} /> Delete</button>
         </div>
@@ -1182,47 +1053,44 @@ function BorrowerDetail({ data, borrowerId, setPage, goLoan, setModal, t, update
         <div>
           <div style={{ fontWeight: 700, fontSize: 15, textTransform: "uppercase", letterSpacing: 0.4, color: C.ink3, marginBottom: 10 }}>Loan history</div>
           {loans.length === 0 ? <Card><EmptyState icon={Wallet} title="No loans yet" /></Card> : (
-            <Card style={{ padding: 0, overflow: "hidden", marginBottom: 14 }}>
-              {loans.sort((a,b)=>new Date(b.issueDate)-new Date(a.issueDate)).map((l, i) => {
-                const st = loanStatus(l, data.payments);
-                const canRenew = st === "Active" || st === "Overdue";
-                return (
-                  <div key={l.id} style={{
-                    display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px",
-                    borderBottom: i < loans.length - 1 ? `1px solid ${C.border}` : "none"
-                  }}>
-                    <div onClick={() => goLoan(l.id)} style={{ cursor: "pointer", flex: 1 }}>
-                      <div style={{ fontWeight: 600, fontSize: 15.5, ...numFont }}>{l.loanNumber}</div>
-                      <div style={{ fontSize: 14, color: C.ink3 }}>
-                        Issued {l.issueDate}{l.issuedAt ? ` at ${formatTime(l.issuedAt)}` : ""} · Expires {l.dueDate} · {fmt(l.amount)} principal{l.renewedFromId ? " · renewal" : ""}{l.isHistorical ? " · migrated record" : ""}
+            <>
+              <Card style={{ padding: 0, overflow: "hidden", marginBottom: 14 }}>
+                {loans.map((l, i) => {
+                  const st = l.status;
+                  const canRenew = st === "Active" || st === "Overdue";
+                  return (
+                    <div key={l.id} style={{
+                      display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px",
+                      borderBottom: i < loans.length - 1 ? `1px solid ${C.border}` : "none"
+                    }}>
+                      <div onClick={() => goLoan(l.id)} style={{ cursor: "pointer", flex: 1 }}>
+                        <div style={{ fontWeight: 600, fontSize: 15.5, ...numFont }}>{l.loanNumber}</div>
+                        <div style={{ fontSize: 14, color: C.ink3 }}>
+                          Issued {l.issueDate}{l.issuedAt ? ` at ${formatTime(l.issuedAt)}` : ""} · Expires {l.dueDate} · {fmt(l.amount)} principal{l.renewedFromId ? " · renewal" : ""}{l.isHistorical ? " · migrated record" : ""}
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        {canRenew && (
+                          <button style={{ ...Btn.ghost, padding: "5px 8px", fontSize: 13 }} onClick={(e) => { e.stopPropagation(); setModal({ type: "renew", payload: { loanId: l.id } }); }}>
+                            <RefreshCw size={12} /> Renew
+                          </button>
+                        )}
+                        {canRenew && (
+                          <button style={{ ...Btn.ghost, padding: "5px 8px", fontSize: 13, color: C.forestDark }} onClick={(e) => { e.stopPropagation(); markPaid(l); }}>
+                            <CheckCircle2 size={12} /> Mark as Paid
+                          </button>
+                        )}
+                        <StampBadge status={st} />
                       </div>
                     </div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      {canRenew && (
-                        <button style={{ ...Btn.ghost, padding: "5px 8px", fontSize: 13 }} onClick={(e) => { e.stopPropagation(); setModal({ type: "renew", payload: { loanId: l.id } }); }}>
-                          <RefreshCw size={12} /> Renew
-                        </button>
-                      )}
-                      {canRenew && (
-                        <button style={{ ...Btn.ghost, padding: "5px 8px", fontSize: 13, color: C.forestDark }} onClick={(e) => {
-                          e.stopPropagation();
-                          const outstanding = Math.max(0, l.totalPayable - paidAmountFor(l.id, data.payments));
-                          if (!window.confirm(`Mark ${l.loanNumber} as fully paid? This records a payment of ${fmt(outstanding)} to close it out.`)) return;
-                          update((d) => { markLoanPaidInData(d, l.id); }, `Marked loan ${l.loanNumber} as fully paid`);
-                          showToast("Loan marked as fully paid.");
-                        }}>
-                          <CheckCircle2 size={12} /> Mark as Paid
-                        </button>
-                      )}
-                      <StampBadge status={st} />
-                    </div>
-                  </div>
-                );
-              })}
-            </Card>
+                  );
+                })}
+              </Card>
+              <Pager page={data.loanPage} pageCount={data.loanPageCount} total={data.loanTotal} onPage={setLoanPage} />
+            </>
           )}
 
-          <div style={{ fontWeight: 700, fontSize: 15, textTransform: "uppercase", letterSpacing: 0.4, color: C.ink3, marginBottom: 10 }}>Collateral on file</div>
+          <div style={{ fontWeight: 700, fontSize: 15, textTransform: "uppercase", letterSpacing: 0.4, color: C.ink3, margin: "14px 0 10px" }}>Collateral on file</div>
           {collateral.length === 0 ? <Card><EmptyState icon={Lock} title="No collateral recorded" /></Card> : (
             <Card style={{ padding: 0, overflow: "hidden" }}>
               {collateral.map((c, i) => (
@@ -1244,33 +1112,6 @@ function BorrowerDetail({ data, borrowerId, setPage, goLoan, setModal, t, update
 
 /* ---------------------------------- loans ----------------------------------- */
 
-function startOfWeek(d) {
-  const date = new Date(d);
-  const day = (date.getDay() + 6) % 7; // 0 = Monday
-  date.setDate(date.getDate() - day);
-  date.setHours(0, 0, 0, 0);
-  return date;
-}
-
-function loanGroupKey(dateStr, groupBy) {
-  const d = new Date(dateStr + "T00:00:00");
-  if (groupBy === "day") {
-    return { key: dateStr, label: d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" }) };
-  }
-  if (groupBy === "week") {
-    const start = startOfWeek(d);
-    const end = new Date(start); end.setDate(end.getDate() + 6);
-    const key = start.toISOString().slice(0, 10);
-    const label = `Week of ${start.toLocaleDateString("en-GB", { day: "numeric", month: "short" })} to ${end.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}`;
-    return { key, label };
-  }
-  if (groupBy === "year") {
-    return { key: String(d.getFullYear()), label: String(d.getFullYear()) };
-  }
-  const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-  return { key, label: d.toLocaleDateString("en-GB", { month: "long", year: "numeric" }) };
-}
-
 const GROUP_OPTIONS = [
   { id: "day", label: "Day" },
   { id: "week", label: "Week" },
@@ -1282,39 +1123,32 @@ const GROUP_OPTIONS = [
 
 const FUND_TYPES = ["External Loan", "Bank"];
 
-function fundRepaidAmount(fundId, fundRepayments) {
-  return fundRepayments.filter((r) => r.fundId === fundId && !r.voided).reduce((s, r) => s + Number(r.amount), 0);
-}
-function fundStatus(fund, fundRepayments) {
-  if (fund.voided) return "Voided";
-  const repaid = fundRepaidAmount(fund.id, fundRepayments);
-  if (repaid >= fund.amount - 0.5) return "Fully Paid";
-  return "Outstanding";
-}
-
-function Loans({ data, goLoan, setModal, update, showToast }) {
+function Loans({ goLoan, setModal, update, showToast, actor, version }) {
   const [filter, setFilter] = useState("All");
   const [groupBy, setGroupBy] = useState("month");
   const [selectedKey, setSelectedKey] = useState(null);
+  const [page, setPage] = usePageState();
   const scrollRef = useRef(null);
+  const { loading, data, error } = useServerData(
+    () => api().loans.page({ filter, groupBy, groupKey: selectedKey, page, limit: 50 }),
+    [filter, groupBy, selectedKey, page, version]
+  );
+  useEffect(() => { setSelectedKey(null); setPage(1); }, [filter, groupBy]);
+  useEffect(() => { setPage(1); }, [selectedKey]);
 
-  const loans = data.loans.filter((l) => {
-    if (filter === "All") return true;
-    return loanStatus(l, data.payments) === filter;
-  }).sort((a, b) => new Date(b.issueDate) - new Date(a.issueDate));
-
-  const groups = {};
-  loans.forEach((l) => {
-    const { key, label } = loanGroupKey(l.issueDate, groupBy);
-    if (!groups[key]) groups[key] = { label, loans: [] };
-    groups[key].loans.push(l);
-  });
-  const groupKeys = Object.keys(groups).sort((a, b) => b.localeCompare(a));
-  const activeKey = (selectedKey && groups[selectedKey]) ? selectedKey : groupKeys[0];
-  const activeGroup = activeKey ? groups[activeKey] : null;
+  const groups = data?.groups || [];
+  const activeGroup = groups.find((g) => g.key === data?.groupKey);
 
   const scrollBy = (dir) => {
     if (scrollRef.current) scrollRef.current.scrollBy({ left: dir * 240, behavior: "smooth" });
+  };
+
+  const markPaid = async (l) => {
+    if (!window.confirm(`Mark ${l.loanNumber} as fully paid? This records a payment of ${fmt(l.outstanding)} to close it out.`)) return;
+    const result = await api().loans.markPaid({ actor, id: l.id });
+    if (!result?.ok) return showToast(result?.error || "Could not mark this loan as paid.");
+    showToast("Loan marked as fully paid.");
+    update();
   };
 
   return (
@@ -1334,7 +1168,7 @@ function Loans({ data, goLoan, setModal, update, showToast }) {
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
         <span style={{ fontSize: 13.5, color: C.ink3, fontWeight: 600 }}>Group by</span>
         {GROUP_OPTIONS.map((g) => (
-          <div key={g.id} onClick={() => { setGroupBy(g.id); setSelectedKey(null); }} style={{
+          <div key={g.id} onClick={() => setGroupBy(g.id)} style={{
             padding: "5px 12px", borderRadius: 20, fontSize: 13.5, fontWeight: 600, cursor: "pointer",
             background: groupBy === g.id ? C.brassDark : C.surface, color: groupBy === g.id ? "#fff" : C.ink2,
             border: `1px solid ${groupBy === g.id ? C.brassDark : C.border}`
@@ -1342,7 +1176,7 @@ function Loans({ data, goLoan, setModal, update, showToast }) {
         ))}
       </div>
 
-      {loans.length === 0 ? <Card><EmptyState icon={Wallet} title="No loans found" /></Card> : (
+      {loading && !data ? <LoadingCard /> : error ? <ErrorCard error={error} /> : groups.length === 0 ? <Card><EmptyState icon={Wallet} title="No loans found" /></Card> : (
         <>
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
             <div onClick={() => scrollBy(-1)} style={{
@@ -1354,27 +1188,24 @@ function Loans({ data, goLoan, setModal, update, showToast }) {
               display: "flex", gap: 10, overflowX: "auto", scrollSnapType: "x proximity",
               padding: "4px 2px 10px"
             }}>
-              {groupKeys.map((key) => {
-                const group = groups[key];
-                const isActive = key === activeKey;
-                const totalPrincipal = group.loans.reduce((s, l) => s + Number(l.amount), 0);
-                const totalOutstanding = group.loans.reduce((s, l) => s + Math.max(0, l.totalPayable - paidAmountFor(l.id, data.payments)), 0);
+              {groups.map((group) => {
+                const isActive = group.key === data.groupKey;
                 return (
-                  <div key={key} onClick={() => setSelectedKey(key)} style={{
+                  <div key={group.key} onClick={() => setSelectedKey(group.key)} style={{
                     flex: "0 0 auto", scrollSnapAlign: "start", width: 190, borderRadius: 12, padding: 14, cursor: "pointer",
                     background: isActive ? C.forest : C.surface, border: `1px solid ${isActive ? C.forest : C.border}`,
                     boxShadow: isActive ? "0 6px 18px rgba(46,74,50,0.25)" : "none", transition: "background .15s, box-shadow .15s"
                   }}>
                     <div style={{ fontWeight: 700, fontSize: 14.5, color: isActive ? "#fff" : C.ink, ...displayFont, lineHeight: 1.25, minHeight: 36 }}>{group.label}</div>
-                    <div style={{ fontSize: 12.5, color: isActive ? "#D8E3D2" : C.ink3, marginTop: 6 }}>{group.loans.length} loan{group.loans.length !== 1 ? "s" : ""}</div>
+                    <div style={{ fontSize: 12.5, color: isActive ? "#D8E3D2" : C.ink3, marginTop: 6 }}>{group.count} loan{group.count !== 1 ? "s" : ""}</div>
                     <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, paddingTop: 10, borderTop: `1px solid ${isActive ? "rgba(255,255,255,0.2)" : C.border}` }}>
                       <div>
                         <div style={{ fontSize: 11, color: isActive ? "#D8E3D2" : C.ink4 }}>Lent</div>
-                        <div style={{ ...numFont, fontSize: 13, fontWeight: 700, color: isActive ? "#fff" : C.ink }}>{fmt(totalPrincipal)}</div>
+                        <div style={{ ...numFont, fontSize: 13, fontWeight: 700, color: isActive ? "#fff" : C.ink }}>{fmt(group.totalPrincipal)}</div>
                       </div>
                       <div style={{ textAlign: "right" }}>
                         <div style={{ fontSize: 11, color: isActive ? "#D8E3D2" : C.ink4 }}>Owed</div>
-                        <div style={{ ...numFont, fontSize: 13, fontWeight: 700, color: isActive ? "#fff" : (totalOutstanding > 0 ? C.rust : C.ink) }}>{fmt(totalOutstanding)}</div>
+                        <div style={{ ...numFont, fontSize: 13, fontWeight: 700, color: isActive ? "#fff" : (group.totalOutstanding > 0 ? C.rust : C.ink) }}>{fmt(group.totalOutstanding)}</div>
                       </div>
                     </div>
                   </div>
@@ -1389,46 +1220,46 @@ function Loans({ data, goLoan, setModal, update, showToast }) {
           </div>
 
           {activeGroup && (
-            <Card style={{ padding: 0, overflow: "hidden" }}>
-              <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}`, background: C.forestSoft, fontWeight: 700, fontSize: 14.5, color: C.forestDark }}>
-                {activeGroup.label}
-              </div>
-              {activeGroup.loans.map((l, i) => {
-                const st = loanStatus(l, data.payments);
-                const outstanding = Math.max(0, l.totalPayable - paidAmountFor(l.id, data.payments));
-                const canMarkPaid = st === "Active" || st === "Overdue";
-                return (
-                  <div key={l.id} onClick={() => goLoan(l.id)} style={{
-                    display: "flex", justifyContent: "space-between", alignItems: "center", padding: "13px 18px",
-                    borderBottom: i < activeGroup.loans.length - 1 ? `1px solid ${C.border}` : "none", cursor: "pointer"
-                  }}
-                    onMouseEnter={(e) => e.currentTarget.style.background = C.forestSoft}
-                    onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
-                    <div>
-                      <div style={{ fontWeight: 600, fontSize: 16, ...numFont }}>{l.loanNumber}</div>
-                      <div style={{ fontSize: 14.5, color: C.ink3, marginTop: 2 }}>{borrowerName(data.borrowers, l.borrowerId)} · issued {l.issueDate} · due {l.dueDate}</div>
-                    </div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                      <div style={{ textAlign: "right" }}>
-                        <div style={{ ...numFont, fontWeight: 600, fontSize: 16 }}>{fmt(outstanding)}</div>
-                        <div style={{ fontSize: 13, color: C.ink4 }}>remaining</div>
+            <>
+              <Card style={{ padding: 0, overflow: "hidden" }}>
+                <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}`, background: C.forestSoft, fontWeight: 700, fontSize: 14.5, color: C.forestDark }}>
+                  {activeGroup.label}
+                </div>
+                {data.items.map((l, i) => {
+                  const st = l.status;
+                  const canMarkPaid = st === "Active" || st === "Overdue";
+                  return (
+                    <div key={l.id} onClick={() => goLoan(l.id)} style={{
+                      display: "flex", justifyContent: "space-between", alignItems: "center", padding: "13px 18px",
+                      borderBottom: i < data.items.length - 1 ? `1px solid ${C.border}` : "none", cursor: "pointer"
+                    }}
+                      onMouseEnter={(e) => e.currentTarget.style.background = C.forestSoft}
+                      onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
+                      <div>
+                        <div style={{ fontWeight: 600, fontSize: 16, ...numFont }}>{l.loanNumber}</div>
+                        <div style={{ fontSize: 14.5, color: C.ink3, marginTop: 2 }}>{l.borrowerName || "Unknown borrower"} · issued {l.issueDate} · due {l.dueDate}</div>
                       </div>
-                      {canMarkPaid && (
-                        <button style={{ ...Btn.ghost, padding: "5px 8px", fontSize: 13, color: C.forestDark }} onClick={(e) => {
-                          e.stopPropagation();
-                          if (!window.confirm(`Mark ${l.loanNumber} as fully paid? This records a payment of ${fmt(outstanding)} to close it out.`)) return;
-                          update((d) => { markLoanPaidInData(d, l.id); }, `Marked loan ${l.loanNumber} as fully paid`);
-                          showToast("Loan marked as fully paid.");
-                        }}>
-                          <CheckCircle2 size={12} /> Mark as Paid
-                        </button>
-                      )}
-                      <StampBadge status={st} />
+                      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                        <div style={{ textAlign: "right" }}>
+                          <div style={{ ...numFont, fontWeight: 600, fontSize: 16 }}>{fmt(l.outstanding)}</div>
+                          <div style={{ fontSize: 13, color: C.ink4 }}>remaining</div>
+                        </div>
+                        {canMarkPaid && (
+                          <button style={{ ...Btn.ghost, padding: "5px 8px", fontSize: 13, color: C.forestDark }} onClick={(e) => {
+                            e.stopPropagation();
+                            markPaid(l);
+                          }}>
+                            <CheckCircle2 size={12} /> Mark as Paid
+                          </button>
+                        )}
+                        <StampBadge status={st} />
+                      </div>
                     </div>
-                  </div>
-                );
-              })}
-            </Card>
+                  );
+                })}
+              </Card>
+              <Pager page={data.page} pageCount={data.pageCount} total={data.total} onPage={setPage} />
+            </>
           )}
         </>
       )}
@@ -1436,32 +1267,56 @@ function Loans({ data, goLoan, setModal, update, showToast }) {
   );
 }
 
-function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorrower, goLoan, t, role, currentUser }) {
-  const l = data.loans.find((x) => x.id === loanId);
-  if (!l) return <EmptyState icon={Wallet} title="Loan not found" />;
-  const borrower = data.borrowers.find((b) => b.id === l.borrowerId);
-  const payments = data.payments.filter((p) => p.loanId === l.id).sort((a, b) => new Date(b.date) - new Date(a.date));
-  const collateral = data.collateral.filter((c) => c.loanId === l.id);
-  const paid = paidAmountFor(l.id, data.payments);
-  const outstanding = Math.max(0, l.totalPayable - paid);
-  const outstandingNoInterest = Math.max(0, l.amount - principalPaidFor(l.id, data.payments));
-  const st = loanStatus(l, data.payments);
-  const nextDue = st !== "Fully Paid" ? nextDueDate(l, data.payments) : null;
+function LoanDetail({ loanId, setPage, update, showToast, setModal, goBorrower, goLoan, t, role, currentUser, actor, boot, version }) {
+  const { loading, data, error } = useServerData(
+    () => api().loans.get({ id: loanId, paymentLimit: 1000 }),
+    [loanId, version]
+  );
+  if (loading && !data) return <LoadingCard />;
+  if (error) return <ErrorCard error={error} />;
+  if (!data) return <EmptyState icon={Wallet} title="Loan not found" />;
 
-  const voidLoan = () => {
+  const { loan: l, borrower, payments, paymentCount, paymentsTruncated, collateral } = data;
+  const paid = l.paidAmount;
+  const outstanding = l.outstanding;
+  const outstandingNoInterest = l.outstandingNoInterest;
+  const st = l.status;
+  const nextDue = l.nextDueDate;
+
+  const voidLoan = async () => {
     const reason = prompt("Reason for voiding this loan (required):");
     if (!reason) return;
-    update((d) => {
-      const loan = d.loans.find((x) => x.id === l.id);
-      loan.voided = true; loan.voidReason = reason; loan.voidedAt = todayISO();
-    }, `Voided loan ${l.loanNumber} (reason: ${reason})`);
+    const result = await api().loans.voidLoan({ actor, id: l.id, reason });
+    if (!result?.ok) return showToast(result?.error || "Could not void this loan.");
     showToast("Loan voided and kept in history.");
+    update();
   };
 
-  const markPaid = () => {
+  const markPaid = async () => {
     if (!window.confirm(`Mark ${l.loanNumber} as fully paid? This records a payment of ${fmt(outstanding)} to close it out.`)) return;
-    update((d) => { markLoanPaidInData(d, l.id); }, `Marked loan ${l.loanNumber} as fully paid`);
+    const result = await api().loans.markPaid({ actor, id: l.id });
+    if (!result?.ok) return showToast(result?.error || "Could not mark this loan as paid.");
     showToast("Loan marked as fully paid.");
+    update();
+  };
+
+  const releaseCollateral = async (c) => {
+    if (!window.confirm(`Mark "${c.description}" as collected by the borrower?`)) return;
+    const result = await api().collateral.release({ actor, id: c.id });
+    if (!result?.ok) return showToast(result?.error || "Could not update this collateral.");
+    showToast("Collateral marked as paid / collected.");
+    update();
+  };
+
+  const exportLoan = async (kind) => {
+    try {
+      const full = await api().loans.get({ id: l.id, paymentLimit: 5000 });
+      if (!full) return;
+      if (kind === "print") printHTMLAsPDF(loanRecordHTML(boot?.settings?.businessName || "Ledger", full));
+      else downloadLoanRecordCSV(boot?.settings?.businessName || "Ledger", full);
+    } catch (e) {
+      showToast(e.message || "Could not build that file.");
+    }
   };
 
   return (
@@ -1476,11 +1331,11 @@ function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorr
               <span style={{ fontSize: 12.5, fontWeight: 700, color: C.brassDark, background: C.brassSoft, border: "1px solid #DFC488", borderRadius: 20, padding: "3px 10px" }}>Migrated record</span>
             )}
           </div>
-          <div onClick={() => goBorrower(borrower.id)} style={{ color: C.forest, fontSize: 15.5, marginTop: 5, cursor: "pointer", fontWeight: 600 }}>{borrower?.fullName} →</div>
+          <div onClick={() => goBorrower(l.borrowerId)} style={{ color: C.forest, fontSize: 15.5, marginTop: 5, cursor: "pointer", fontWeight: 600 }}>{borrower?.fullName} →</div>
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-start" }}>
-          <button style={Btn.secondary} onClick={() => printHTMLAsPDF(loanRecordHTML(data, l))}><FileType size={13} /> Print</button>
-          <button style={Btn.secondary} onClick={() => downloadLoanRecordCSV(data, l)}><Download size={13} /> Download CSV</button>
+          <button style={Btn.secondary} onClick={() => exportLoan("print")}><FileType size={13} /> Print</button>
+          <button style={Btn.secondary} onClick={() => exportLoan("csv")}><Download size={13} /> Download CSV</button>
           <button style={Btn.secondary} onClick={() => setModal({ type: "editLoan", payload: { loanId: l.id } })}><Edit2 size={13} /> Edit loan</button>
           {!l.voided && !l.renewed && (
             <>
@@ -1496,10 +1351,10 @@ function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorr
             </>
           )}
           <button style={Btn.danger} onClick={() => confirmOrRequestDelete({
-            role, currentUser, update, showToast, setModal,
+            role, currentUser, update, showToast, setModal, actor,
             entityType: "loan", entityId: l.id, entityLabel: `loan ${l.loanNumber}`,
             title: "Delete loan permanently",
-            message: `Permanently delete loan ${l.loanNumber} for ${borrower?.fullName}? This will also permanently delete its ${payments.length} payment${payments.length !== 1 ? "s" : ""} and ${collateral.length} collateral record${collateral.length !== 1 ? "s" : ""}. This cannot be undone and is different from Void, which keeps history. Consider Void instead unless this loan was created by mistake.`,
+            message: `Permanently delete loan ${l.loanNumber} for ${borrower?.fullName}? This will also permanently delete its ${paymentCount} payment${paymentCount !== 1 ? "s" : ""} and ${data.collateralCount} collateral record${data.collateralCount !== 1 ? "s" : ""}. This cannot be undone and is different from Void, which keeps history. Consider Void instead unless this loan was created by mistake.`,
             onDeleted: () => setPage("loans"),
           })}><Ban size={13} /> Delete permanently</button>
         </div>
@@ -1515,7 +1370,7 @@ function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorr
         <Card style={{ background: "#E7E1F2", border: "1px solid #D2C6E8", marginBottom: 14 }}>
           <div style={{ fontSize: 15, color: "#4A3B72" }}>
             This loan was renewed on {l.renewedAt}. Its balance was carried into a new loan.
-            <span style={{ color: "#5A4A8C", cursor: "pointer", fontWeight: 700, marginLeft: 6 }} onClick={() => goLoan(l.renewedIntoId)}>View the new loan →</span>
+            {l.renewedIntoId && <span style={{ color: "#5A4A8C", cursor: "pointer", fontWeight: 700, marginLeft: 6 }} onClick={() => goLoan(l.renewedIntoId)}>View the new loan →</span>}
           </div>
         </Card>
       )}
@@ -1558,11 +1413,11 @@ function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorr
             ["Paperwork cost", l.paperworkFee > 0 ? fmt(l.paperworkFee) : "Not charged"],
             ["Issue date", l.issueDate + (l.issuedAt ? ` at ${formatTime(l.issuedAt)}` : "")], ["Due date", l.dueDate],
             ["Repayment method", l.repaymentMethod],
-            ...(l.repaymentMethod === "Instalments" ? [
+            ...(l.repaymentMethod === "Instalments" && l.instalments ? [
               ["Instalments", `${l.instalments.count} × ${fmt(l.instalments.expectedAmount)}`],
               ["Frequency", l.instalments.frequency],
               ["First payment", l.instalments.firstPaymentDate],
-              ...(nextDue ? [["Next payment due", nextDue]] : []),
+              ...(st !== "Fully Paid" ? [["Next payment due", nextDue]] : []),
             ] : []),
           ].map(([k, v]) => (
             <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${C.border}`, fontSize: 15 }}>
@@ -1583,15 +1438,11 @@ function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorr
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <StampBadge status={c.status} />
                   {c.status !== "Released" && (
-                    <button style={{ ...Btn.ghost, padding: "4px 6px", fontSize: 13.5 }} onClick={() => {
-                      if (!window.confirm(`Mark "${c.description}" as collected by the borrower?`)) return;
-                      update((d) => { d.collateral.find((x) => x.id === c.id).status = "Released"; }, `Marked collateral "${c.description}" as collected (loan ${l.loanNumber})`);
-                      showToast("Collateral marked as paid / collected.");
-                    }}><PackageCheck size={13} /> Mark as Paid</button>
+                    <button style={{ ...Btn.ghost, padding: "4px 6px", fontSize: 13.5 }} onClick={() => releaseCollateral(c)}><PackageCheck size={13} /> Mark as Paid</button>
                   )}
                   <button style={{ ...Btn.ghost, padding: "4px 6px", fontSize: 13.5 }} onClick={() => setModal({ type: "collateral", payload: { existing: c } })}><Edit2 size={13} /></button>
                   <button style={{ ...Btn.ghost, padding: "4px 6px", fontSize: 13.5, color: C.rust }} onClick={() => confirmOrRequestDelete({
-                    role, currentUser, update, showToast, setModal,
+                    role, currentUser, update, showToast, setModal, actor,
                     entityType: "collateral", entityId: c.id, entityLabel: `collateral "${c.description}"`,
                     title: "Delete collateral record",
                     message: `Permanently delete "${c.description}" from this loan? This cannot be undone.`,
@@ -1621,7 +1472,7 @@ function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorr
                   <div style={{ display: "flex", gap: 2 }}>
                     <button style={{ ...Btn.ghost, padding: "4px 6px" }} onClick={() => setModal({ type: "payment", payload: { existing: p } })}><Edit2 size={13} /></button>
                     <button style={{ ...Btn.ghost, padding: "4px 6px", color: C.rust }} onClick={() => confirmOrRequestDelete({
-                      role, currentUser, update, showToast, setModal,
+                      role, currentUser, update, showToast, setModal, actor,
                       entityType: "payment", entityId: p.id, entityLabel: `payment of ${fmt(p.amount)} on loan ${l.loanNumber}`,
                       title: "Delete payment",
                       message: `Permanently delete this payment of ${fmt(p.amount)} on ${p.date}? This will increase the loan's outstanding balance. This cannot be undone.`,
@@ -1630,6 +1481,11 @@ function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorr
                 </div>
               </div>
             ))}
+            {paymentsTruncated && (
+              <div style={{ padding: "10px 16px", fontSize: 13.5, color: C.ink3, background: C.bg }}>
+                Showing the latest {payments.length} of {paymentCount} payments. The printed statement includes the most recent 5,000.
+              </div>
+            )}
           </Card>
         )}
       </div>
@@ -1639,40 +1495,54 @@ function LoanDetail({ data, loanId, setPage, update, showToast, setModal, goBorr
 
 /* --------------------------------- payments --------------------------------- */
 
-function Payments({ data, update, showToast, goLoan, setModal, role, currentUser }) {
-  const list = [...data.payments].sort((a, b) => new Date(b.date) - new Date(a.date));
+function Payments({ update, showToast, goLoan, setModal, role, currentUser, actor, version }) {
+  const [q, setQ] = useState("");
+  const search = useDebounced(q, 250);
+  const [page, setPage] = usePageState();
+  const { loading, data, error } = useServerData(
+    () => api().payments.page({ page, q: search, limit: 50 }),
+    [page, search, version]
+  );
+  useEffect(() => { setPage(1); }, [search]);
+  const list = data?.items || [];
+
   return (
     <div>
       <SectionTitle action={<button style={Btn.primary} onClick={() => setModal({ type: "payment" })}><Plus size={15} /> Record Payment</button>}>Payments</SectionTitle>
-      {list.length === 0 ? <Card><EmptyState icon={CreditCard} title="No payments recorded yet" /></Card> : (
-        <Card style={{ padding: 0, overflow: "hidden" }}>
-          {list.map((p, i) => {
-            const loan = data.loans.find((l) => l.id === p.loanId);
-            return (
-              <div key={p.id} style={{
-                display: "flex", justifyContent: "space-between", alignItems: "center", padding: "13px 18px",
-                borderBottom: i < list.length - 1 ? `1px solid ${C.border}` : "none", opacity: p.voided ? 0.5 : 1
-              }}>
-                <div onClick={() => goLoan(p.loanId)} style={{ cursor: "pointer", flex: 1 }}>
-                  <div style={{ fontWeight: 600, fontSize: 16 }}>{borrowerName(data.borrowers, p.borrowerId)}</div>
-                  <div style={{ fontSize: 14.5, color: C.ink3, marginTop: 2 }}>{loan?.loanNumber} · {p.date} · {p.method}{p.voided ? " · VOIDED" : ""}</div>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <div style={{ ...numFont, fontWeight: 700, fontSize: 17 }}>{fmt(p.amount)}</div>
-                  <div style={{ display: "flex", gap: 2 }}>
-                    <button style={{ ...Btn.ghost, padding: "5px 7px" }} onClick={() => setModal({ type: "payment", payload: { existing: p } })}><Edit2 size={13} /></button>
-                    <button style={{ ...Btn.ghost, padding: "5px 7px", color: C.rust }} onClick={() => confirmOrRequestDelete({
-                      role, currentUser, update, showToast, setModal,
-                      entityType: "payment", entityId: p.id, entityLabel: `payment of ${fmt(p.amount)}${loan ? ` on loan ${loan.loanNumber}` : ""}`,
-                      title: "Delete payment",
-                      message: `Permanently delete this payment of ${fmt(p.amount)}${loan ? ` on loan ${loan.loanNumber}` : ""}? This will increase the loan's outstanding balance. This cannot be undone.`,
-                    })}><Ban size={13} /></button>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search by borrower, loan number, or reference…"
+        style={{ ...FieldStyle.input, marginBottom: 14, maxWidth: 400 }} />
+      {loading && !data ? <LoadingCard /> : error ? <ErrorCard error={error} /> : list.length === 0 ? <Card><EmptyState icon={CreditCard} title="No payments recorded yet" sub={search ? "No payments match that search." : undefined} /></Card> : (
+        <>
+          <Card style={{ padding: 0, overflow: "hidden" }}>
+            {list.map((p, i) => {
+              const loan = { loanNumber: p.loanNumber };
+              return (
+                <div key={p.id} style={{
+                  display: "flex", justifyContent: "space-between", alignItems: "center", padding: "13px 18px",
+                  borderBottom: i < list.length - 1 ? `1px solid ${C.border}` : "none", opacity: p.voided ? 0.5 : 1
+                }}>
+                  <div onClick={() => goLoan(p.loanId)} style={{ cursor: "pointer", flex: 1 }}>
+                    <div style={{ fontWeight: 600, fontSize: 16 }}>{p.borrowerName || "Unknown borrower"}</div>
+                    <div style={{ fontSize: 14.5, color: C.ink3, marginTop: 2 }}>{loan.loanNumber} · {p.date} · {p.method}{p.voided ? " · VOIDED" : ""}</div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <div style={{ ...numFont, fontWeight: 700, fontSize: 17 }}>{fmt(p.amount)}</div>
+                    <div style={{ display: "flex", gap: 2 }}>
+                      <button style={{ ...Btn.ghost, padding: "5px 7px" }} onClick={() => setModal({ type: "payment", payload: { existing: p } })}><Edit2 size={13} /></button>
+                      <button style={{ ...Btn.ghost, padding: "5px 7px", color: C.rust }} onClick={() => confirmOrRequestDelete({
+                        role, currentUser, update, showToast, setModal, actor,
+                        entityType: "payment", entityId: p.id, entityLabel: `payment of ${fmt(p.amount)}${loan.loanNumber ? ` on loan ${loan.loanNumber}` : ""}`,
+                        title: "Delete payment",
+                        message: `Permanently delete this payment of ${fmt(p.amount)}${loan.loanNumber ? ` on loan ${loan.loanNumber}` : ""}? This will increase the loan's outstanding balance. This cannot be undone.`,
+                      })}><Ban size={13} /></button>
+                    </div>
                   </div>
                 </div>
-              </div>
-            );
-          })}
-        </Card>
+              );
+            })}
+          </Card>
+          <Pager page={data.page} pageCount={data.pageCount} total={data.total} onPage={setPage} />
+        </>
       )}
     </div>
   );
@@ -1680,57 +1550,72 @@ function Payments({ data, update, showToast, goLoan, setModal, role, currentUser
 
 /* -------------------------------- collateral --------------------------------- */
 
-function Collateral({ data, update, showToast, setModal, goLoan, role, currentUser }) {
-  const list = [...data.collateral].sort((a, b) => new Date(b.dateReceived) - new Date(a.dateReceived));
+function Collateral({ update, showToast, setModal, goLoan, role, currentUser, actor, version }) {
+  const [q, setQ] = useState("");
+  const search = useDebounced(q, 250);
+  const [page, setPage] = usePageState();
+  const { loading, data, error } = useServerData(
+    () => api().collateral.page({ page, q: search, limit: 40 }),
+    [page, search, version]
+  );
+  useEffect(() => { setPage(1); }, [search]);
+  const list = data?.items || [];
 
-  const markCollected = (c, e) => {
+  const markCollected = async (c, e) => {
     e.stopPropagation();
     if (!window.confirm(`Mark "${c.description}" as collected by the borrower?`)) return;
-    update((d) => { d.collateral.find((x) => x.id === c.id).status = "Released"; }, `Marked collateral "${c.description}" as collected`);
+    const result = await api().collateral.release({ actor, id: c.id });
+    if (!result?.ok) return showToast(result?.error || "Could not update this collateral.");
     showToast("Collateral marked as paid / collected.");
+    update();
   };
 
   return (
     <div>
       <SectionTitle action={<button style={Btn.primary} onClick={() => setModal({ type: "collateral" })}><Plus size={15} /> Add Collateral</button>}>Security / Collateral</SectionTitle>
-      {list.length === 0 ? <Card><EmptyState icon={Lock} title="No collateral recorded" /></Card> : (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(260px,1fr))", gap: 12 }}>
-          {list.map((c) => (
-            <Card key={c.id}>
-              <div onClick={() => goLoan(c.loanId)} style={{ cursor: "pointer" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                  <div style={{ fontWeight: 700, fontSize: 17 }}>{c.description}</div>
-                  <StampBadge status={c.status} />
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search item, borrower, or loan number…"
+        style={{ ...FieldStyle.input, marginBottom: 14, maxWidth: 400 }} />
+      {loading && !data ? <LoadingCard /> : error ? <ErrorCard error={error} /> : list.length === 0 ? <Card><EmptyState icon={Lock} title="No collateral recorded" sub={search ? "Nothing matches that search." : undefined} /></Card> : (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(260px,1fr))", gap: 12 }}>
+            {list.map((c) => (
+              <Card key={c.id}>
+                <div onClick={() => c.loanId && goLoan(c.loanId)} style={{ cursor: c.loanId ? "pointer" : "default" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                    <div style={{ fontWeight: 700, fontSize: 17 }}>{c.description}</div>
+                    <StampBadge status={c.status} />
+                  </div>
+                  <div style={{ fontSize: 14.5, color: C.ink3, marginTop: 4 }}>{c.category}{c.brand ? ` · ${c.brand}` : ""}{c.model ? ` ${c.model}` : ""}</div>
+                  <div style={{ fontSize: 14.5, color: C.ink3 }}>Borrower: {c.borrowerName || "Unknown"}{c.loanNumber ? ` · ${c.loanNumber}` : ""}</div>
+                  <div style={{ ...numFont, fontWeight: 600, fontSize: 17, marginTop: 8 }}>{fmt(c.estimatedValue)}</div>
+                  <div style={{ fontSize: 13.5, color: C.ink4, marginTop: 4 }}>{c.storageLocation ? `Stored: ${c.storageLocation}` : ""}</div>
                 </div>
-                <div style={{ fontSize: 14.5, color: C.ink3, marginTop: 4 }}>{c.category}{c.brand ? ` · ${c.brand}` : ""}{c.model ? ` ${c.model}` : ""}</div>
-                <div style={{ fontSize: 14.5, color: C.ink3 }}>Borrower: {borrowerName(data.borrowers, c.borrowerId)}</div>
-                <div style={{ ...numFont, fontWeight: 600, fontSize: 17, marginTop: 8 }}>{fmt(c.estimatedValue)}</div>
-                <div style={{ fontSize: 13.5, color: C.ink4, marginTop: 4 }}>{c.storageLocation ? `Stored: ${c.storageLocation}` : ""}</div>
-              </div>
-              {c.status !== "Released" && (
-                <button style={{ ...Btn.secondary, width: "100%", justifyContent: "center", marginTop: 12 }} onClick={(e) => markCollected(c, e)}>
-                  <PackageCheck size={13} /> Mark as Paid
-                </button>
-              )}
-              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                <button style={{ ...Btn.ghost, flex: 1, justifyContent: "center", padding: "6px 8px" }} onClick={(e) => { e.stopPropagation(); setModal({ type: "collateral", payload: { existing: c } }); }}>
-                  <Edit2 size={13} /> Edit
-                </button>
-                <button style={{ ...Btn.ghost, flex: 1, justifyContent: "center", padding: "6px 8px", color: C.rust }} onClick={(e) => {
-                  e.stopPropagation();
-                  confirmOrRequestDelete({
-                    role, currentUser, update, showToast, setModal,
-                    entityType: "collateral", entityId: c.id, entityLabel: `collateral "${c.description}"`,
-                    title: "Delete collateral record",
-                    message: `Permanently delete "${c.description}" from this loan's collateral? This cannot be undone.`,
-                  });
-                }}>
-                  <Ban size={13} /> Delete
-                </button>
-              </div>
-            </Card>
-          ))}
-        </div>
+                {c.status !== "Released" && (
+                  <button style={{ ...Btn.secondary, width: "100%", justifyContent: "center", marginTop: 12 }} onClick={(e) => markCollected(c, e)}>
+                    <PackageCheck size={13} /> Mark as Paid
+                  </button>
+                )}
+                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                  <button style={{ ...Btn.ghost, flex: 1, justifyContent: "center", padding: "6px 8px" }} onClick={(e) => { e.stopPropagation(); setModal({ type: "collateral", payload: { existing: c } }); }}>
+                    <Edit2 size={13} /> Edit
+                  </button>
+                  <button style={{ ...Btn.ghost, flex: 1, justifyContent: "center", padding: "6px 8px", color: C.rust }} onClick={(e) => {
+                    e.stopPropagation();
+                    confirmOrRequestDelete({
+                      role, currentUser, update, showToast, setModal, actor,
+                      entityType: "collateral", entityId: c.id, entityLabel: `collateral "${c.description}"`,
+                      title: "Delete collateral record",
+                      message: `Permanently delete "${c.description}" from this loan's collateral? This cannot be undone.`,
+                    });
+                  }}>
+                    <Ban size={13} /> Delete
+                  </button>
+                </div>
+              </Card>
+            ))}
+          </div>
+          <Pager page={data.page} pageCount={data.pageCount} total={data.total} onPage={setPage} />
+        </>
       )}
     </div>
   );
@@ -1738,26 +1623,37 @@ function Collateral({ data, update, showToast, setModal, goLoan, role, currentUs
 
 /* --------------------------------- expenses --------------------------------- */
 
-function Expenses({ data, update, showToast, setModal, role, currentUser }) {
-  const list = [...data.expenses].sort((a, b) => new Date(b.date) - new Date(a.date));
-  const total = list.filter(e=>!e.voided).reduce((s, e) => s + Number(e.amount), 0);
-  const balances = [...computeDailyCashBalances(data)].reverse();
+function Expenses({ update, showToast, setModal, role, currentUser, actor, version }) {
+  const [q, setQ] = useState("");
+  const search = useDebounced(q, 250);
+  const [page, setPage] = usePageState();
   const [showAllDays, setShowAllDays] = useState(false);
-  const visibleBalances = showAllDays ? balances : balances.slice(0, 14);
+  useEffect(() => { setPage(1); }, [search]);
+  const { loading, data, error } = useServerData(
+    () => api().expenses.page({ page, q: search, limit: 50 }),
+    [page, search, version]
+  );
+  const balancesState = useServerData(
+    () => api().expenses.balances({ limit: showAllDays ? 4000 : 14 }),
+    [showAllDays, version]
+  );
+  const list = data?.items || [];
+  const balances = balancesState.data?.days || [];
+  const totalDays = balancesState.data?.totalDays || 0;
 
   return (
     <div>
       <SectionTitle action={<button style={Btn.primary} onClick={() => setModal({ type: "expense" })}><Plus size={15} /> Record Expense</button>}>Operational Costs</SectionTitle>
       <Card style={{ marginBottom: 20, maxWidth: 320 }}>
         <div style={{ fontSize: 14.5, color: C.ink3, fontWeight: 600 }}>Total operational costs</div>
-        <div style={{ ...numFont, fontSize: 26, fontWeight: 700, marginTop: 4, color: C.rust }}>{fmt(total)}</div>
+        <div style={{ ...numFont, fontSize: 26, fontWeight: 700, marginTop: 4, color: C.rust }}>{fmt(data?.totalAmount || 0)}</div>
       </Card>
 
       <div style={{ fontWeight: 700, fontSize: 15, textTransform: "uppercase", letterSpacing: 0.4, color: C.ink3, marginBottom: 4 }}>Daily cash balance</div>
       <div style={{ fontSize: 14, color: C.ink3, marginBottom: 12 }}>
         Opening balance carries over from the day before. It moves every time a loan is given out, a borrower pays, or a cost is recorded. Set the starting figure in Settings.
       </div>
-      {balances.length === 0 ? (
+      {balancesState.loading && !balancesState.data ? <LoadingCard /> : balances.length === 0 ? (
         <Card style={{ marginBottom: 20 }}><EmptyState icon={Wallet} title="No cash movement yet" sub="This fills in as soon as a loan is issued, a payment comes in, or a cost is recorded." /></Card>
       ) : (
         <Card style={{ padding: 0, overflow: "hidden", marginBottom: 20 }}>
@@ -1768,7 +1664,7 @@ function Expenses({ data, update, showToast, setModal, role, currentUser }) {
             <div>Date</div><div style={{ textAlign: "right" }}>Opening</div><div style={{ textAlign: "right" }}>Cash in</div>
             <div style={{ textAlign: "right" }}>Cash out</div><div style={{ textAlign: "right" }}>Closing</div>
           </div>
-          {visibleBalances.map((row, i) => (
+          {balances.map((row) => (
             <div key={row.date} style={{
               display: "grid", gridTemplateColumns: "1.1fr 1fr 1fr 1fr 1.1fr", padding: "11px 18px", alignItems: "center",
               borderTop: `1px solid ${C.border}`, fontSize: 14.5
@@ -1780,41 +1676,46 @@ function Expenses({ data, update, showToast, setModal, role, currentUser }) {
               <div style={{ textAlign: "right", ...numFont, fontWeight: 700, color: row.closing < 0 ? C.rust : C.ink }}>{fmt(row.closing)}</div>
             </div>
           ))}
-          {balances.length > 14 && (
+          {totalDays > 14 && (
             <div onClick={() => setShowAllDays((v) => !v)} style={{
               textAlign: "center", padding: "11px", fontSize: 14, fontWeight: 600, color: C.forest,
               cursor: "pointer", borderTop: `1px solid ${C.border}`
             }}>
-              {showAllDays ? "Show fewer days" : `Show all ${balances.length} days`}
+              {showAllDays ? "Show fewer days" : `Show all ${totalDays} days`}
             </div>
           )}
         </Card>
       )}
 
       <div style={{ fontWeight: 700, fontSize: 15, textTransform: "uppercase", letterSpacing: 0.4, color: C.ink3, marginBottom: 10 }}>Expense log</div>
-      {list.length === 0 ? <Card><EmptyState icon={TrendingDown} title="No expenses recorded yet" /></Card> : (
-        <Card style={{ padding: 0, overflow: "hidden" }}>
-          {list.map((e, i) => (
-            <div key={e.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "13px 18px", borderBottom: i < list.length - 1 ? `1px solid ${C.border}` : "none", opacity: e.voided ? 0.5 : 1 }}>
-              <div>
-                <div style={{ fontWeight: 600, fontSize: 16 }}>{e.description}</div>
-                <div style={{ fontSize: 14.5, color: C.ink3, marginTop: 2 }}>{e.category} · {e.date} · {e.method}{e.voided ? " · VOIDED" : ""}</div>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                <div style={{ ...numFont, fontWeight: 700, fontSize: 17 }}>{fmt(e.amount)}</div>
-                <div style={{ display: "flex", gap: 4 }}>
-                  <button style={{ ...Btn.ghost, padding: "5px 7px" }} onClick={() => setModal({ type: "expense", payload: e })}><Edit2 size={13} /></button>
-                  <button style={{ ...Btn.ghost, padding: "5px 7px", color: C.rust }} onClick={() => confirmOrRequestDelete({
-                    role, currentUser, update, showToast, setModal,
-                    entityType: "expense", entityId: e.id, entityLabel: `expense "${e.description}" (${fmt(e.amount)})`,
-                    title: "Delete expense",
-                    message: `Permanently delete the "${e.description}" expense of ${fmt(e.amount)}? This cannot be undone.`,
-                  })}><Ban size={13} /></button>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search description, category, or method…"
+        style={{ ...FieldStyle.input, marginBottom: 14, maxWidth: 400 }} />
+      {loading && !data ? <LoadingCard /> : error ? <ErrorCard error={error} /> : list.length === 0 ? <Card><EmptyState icon={TrendingDown} title="No expenses recorded yet" sub={search ? "Nothing matches that search." : undefined} /></Card> : (
+        <>
+          <Card style={{ padding: 0, overflow: "hidden" }}>
+            {list.map((e, i) => (
+              <div key={e.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "13px 18px", borderBottom: i < list.length - 1 ? `1px solid ${C.border}` : "none", opacity: e.voided ? 0.5 : 1 }}>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 16 }}>{e.description}</div>
+                  <div style={{ fontSize: 14.5, color: C.ink3, marginTop: 2 }}>{e.category} · {e.date} · {e.method}{e.voided ? " · VOIDED" : ""}</div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                  <div style={{ ...numFont, fontWeight: 700, fontSize: 17 }}>{fmt(e.amount)}</div>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    <button style={{ ...Btn.ghost, padding: "5px 7px" }} onClick={() => setModal({ type: "expense", payload: e })}><Edit2 size={13} /></button>
+                    <button style={{ ...Btn.ghost, padding: "5px 7px", color: C.rust }} onClick={() => confirmOrRequestDelete({
+                      role, currentUser, update, showToast, setModal, actor,
+                      entityType: "expense", entityId: e.id, entityLabel: `expense "${e.description}" (${fmt(e.amount)})`,
+                      title: "Delete expense",
+                      message: `Permanently delete the "${e.description}" expense of ${fmt(e.amount)}? This cannot be undone.`,
+                    })}><Ban size={13} /></button>
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
-        </Card>
+            ))}
+          </Card>
+          <Pager page={data.page} pageCount={data.pageCount} total={data.total} onPage={setPage} />
+        </>
       )}
     </div>
   );
@@ -1822,36 +1723,21 @@ function Expenses({ data, update, showToast, setModal, role, currentUser }) {
 
 /* --------------------------------- external funding page --------------------------------- */
 
-function ExternalFunding({ data, setModal, update, showToast, role, currentUser }) {
+function ExternalFunding({ setModal, update, showToast, role, currentUser, actor, version }) {
   const [groupBy, setGroupBy] = useState("month");
   const [selectedKey, setSelectedKey] = useState(null);
   const scrollRef = useRef(null);
-
-  const funds = data.externalFunds.filter((f) => !f.voided);
-  const repayments = data.fundRepayments.filter((r) => !r.voided);
-
-  const events = [];
-  funds.forEach((f) => events.push({ date: f.dateReceived, kind: "received", type: f.type, amount: f.amount, fund: f }));
-  repayments.forEach((r) => {
-    const fund = data.externalFunds.find((f) => f.id === r.fundId);
-    if (!fund) return;
-    events.push({ date: r.date, kind: "paid", type: fund.type, amount: r.amount, fund, repayment: r });
-  });
-
-  const groups = {};
-  events.forEach((ev) => {
-    const { key, label } = loanGroupKey(ev.date, groupBy);
-    if (!groups[key]) groups[key] = { label, events: [] };
-    groups[key].events.push(ev);
-  });
-  const groupKeys = Object.keys(groups).sort((a, b) => b.localeCompare(a));
-  const activeKey = (selectedKey && groups[selectedKey]) ? selectedKey : groupKeys[0];
-  const activeGroup = activeKey ? groups[activeKey] : null;
+  const overviewState = useServerData(() => api().funding.overview({ groupBy }), [groupBy, version]);
+  const groups = overviewState.data?.groups || [];
+  const activeKey = selectedKey && groups.some((g) => g.key === selectedKey) ? selectedKey : groups[0]?.key;
+  const eventsState = useServerData(
+    () => (activeKey ? api().funding.events({ groupBy, groupKey: activeKey }) : Promise.resolve({ events: [], truncated: false })),
+    [groupBy, activeKey, version]
+  );
+  const activeGroup = groups.find((g) => g.key === activeKey);
+  const events = eventsState.data?.events || [];
 
   const scrollBy = (dir) => { if (scrollRef.current) scrollRef.current.scrollBy({ left: dir * 240, behavior: "smooth" }); };
-
-  const totalExternalOutstanding = funds.filter((f) => f.type === "External Loan").reduce((s, f) => s + Math.max(0, f.amount - fundRepaidAmount(f.id, data.fundRepayments)), 0);
-  const totalBankOutstanding = funds.filter((f) => f.type === "Bank").reduce((s, f) => s + Math.max(0, f.amount - fundRepaidAmount(f.id, data.fundRepayments)), 0);
 
   return (
     <div>
@@ -1865,11 +1751,11 @@ function ExternalFunding({ data, setModal, update, showToast, role, currentUser 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(200px,1fr))", gap: 12, marginBottom: 18 }}>
         <Card>
           <div style={{ fontSize: 13, color: C.ink3, fontWeight: 600 }}>External loans outstanding</div>
-          <div style={{ ...numFont, fontSize: 21, fontWeight: 700, marginTop: 5, color: totalExternalOutstanding > 0 ? C.rust : C.ink }}>{fmt(totalExternalOutstanding)}</div>
+          <div style={{ ...numFont, fontSize: 21, fontWeight: 700, marginTop: 5, color: (overviewState.data?.externalOutstanding || 0) > 0 ? C.rust : C.ink }}>{fmt(overviewState.data?.externalOutstanding || 0)}</div>
         </Card>
         <Card>
           <div style={{ fontSize: 13, color: C.ink3, fontWeight: 600 }}>Bank funds outstanding</div>
-          <div style={{ ...numFont, fontSize: 21, fontWeight: 700, marginTop: 5, color: totalBankOutstanding > 0 ? C.rust : C.ink }}>{fmt(totalBankOutstanding)}</div>
+          <div style={{ ...numFont, fontSize: 21, fontWeight: 700, marginTop: 5, color: (overviewState.data?.bankOutstanding || 0) > 0 ? C.rust : C.ink }}>{fmt(overviewState.data?.bankOutstanding || 0)}</div>
         </Card>
       </div>
 
@@ -1884,7 +1770,7 @@ function ExternalFunding({ data, setModal, update, showToast, role, currentUser 
         ))}
       </div>
 
-      {events.length === 0 ? (
+      {overviewState.loading && !overviewState.data ? <LoadingCard /> : overviewState.error ? <ErrorCard error={overviewState.error} /> : groups.length === 0 ? (
         <Card><EmptyState icon={Landmark} title="No external funding recorded yet" sub="Record money your business receives from external lenders or the bank, and repayments you make on it." /></Card>
       ) : (
         <>
@@ -1897,27 +1783,24 @@ function ExternalFunding({ data, setModal, update, showToast, role, currentUser 
             <div ref={scrollRef} className="lm-carousel" style={{
               display: "flex", gap: 10, overflowX: "auto", scrollSnapType: "x proximity", padding: "4px 2px 10px"
             }}>
-              {groupKeys.map((key) => {
-                const group = groups[key];
-                const isActive = key === activeKey;
-                const received = group.events.filter((e) => e.kind === "received").reduce((s, e) => s + e.amount, 0);
-                const paid = group.events.filter((e) => e.kind === "paid").reduce((s, e) => s + e.amount, 0);
+              {groups.map((group) => {
+                const isActive = group.key === activeKey;
                 return (
-                  <div key={key} onClick={() => setSelectedKey(key)} style={{
+                  <div key={group.key} onClick={() => setSelectedKey(group.key)} style={{
                     flex: "0 0 auto", scrollSnapAlign: "start", width: 190, borderRadius: 12, padding: 14, cursor: "pointer",
                     background: isActive ? C.forest : C.surface, border: `1px solid ${isActive ? C.forest : C.border}`,
                     boxShadow: isActive ? "0 6px 18px rgba(46,74,50,0.25)" : "none", transition: "background .15s, box-shadow .15s"
                   }}>
                     <div style={{ fontWeight: 700, fontSize: 14.5, color: isActive ? "#fff" : C.ink, ...displayFont, lineHeight: 1.25, minHeight: 36 }}>{group.label}</div>
-                    <div style={{ fontSize: 12.5, color: isActive ? "#D8E3D2" : C.ink3, marginTop: 6 }}>{group.events.length} entr{group.events.length !== 1 ? "ies" : "y"}</div>
+                    <div style={{ fontSize: 12.5, color: isActive ? "#D8E3D2" : C.ink3, marginTop: 6 }}>{group.count} entr{group.count !== 1 ? "ies" : "y"}</div>
                     <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, paddingTop: 10, borderTop: `1px solid ${isActive ? "rgba(255,255,255,0.2)" : C.border}` }}>
                       <div>
                         <div style={{ fontSize: 11, color: isActive ? "#D8E3D2" : C.ink4 }}>Received</div>
-                        <div style={{ ...numFont, fontSize: 13, fontWeight: 700, color: isActive ? "#fff" : C.ink }}>{fmt(received)}</div>
+                        <div style={{ ...numFont, fontSize: 13, fontWeight: 700, color: isActive ? "#fff" : C.ink }}>{fmt(group.received)}</div>
                       </div>
                       <div style={{ textAlign: "right" }}>
                         <div style={{ fontSize: 11, color: isActive ? "#D8E3D2" : C.ink4 }}>Paid</div>
-                        <div style={{ ...numFont, fontSize: 13, fontWeight: 700, color: isActive ? "#fff" : C.ink }}>{fmt(paid)}</div>
+                        <div style={{ ...numFont, fontSize: 13, fontWeight: 700, color: isActive ? "#fff" : C.ink }}>{fmt(group.paid)}</div>
                       </div>
                     </div>
                   </div>
@@ -1934,14 +1817,21 @@ function ExternalFunding({ data, setModal, update, showToast, role, currentUser 
           {activeGroup && (
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               <div style={{ fontWeight: 700, fontSize: 14.5, color: C.ink3, textTransform: "uppercase", letterSpacing: 0.4 }}>{activeGroup.label}</div>
-              <FundGroupSection title="External loans received" icon={ArrowDownCircle} tone="forest" setModal={setModal} update={update} showToast={showToast} role={role} currentUser={currentUser}
-                events={activeGroup.events.filter((e) => e.type === "External Loan" && e.kind === "received")} kind="received" />
-              <FundGroupSection title="External loans paid" icon={ArrowUpCircle} tone="rust" setModal={setModal} update={update} showToast={showToast} role={role} currentUser={currentUser}
-                events={activeGroup.events.filter((e) => e.type === "External Loan" && e.kind === "paid")} kind="paid" />
-              <FundGroupSection title="Money from the bank" icon={ArrowDownCircle} tone="forest" setModal={setModal} update={update} showToast={showToast} role={role} currentUser={currentUser}
-                events={activeGroup.events.filter((e) => e.type === "Bank" && e.kind === "received")} kind="received" />
-              <FundGroupSection title="Money from the bank paid" icon={ArrowUpCircle} tone="rust" setModal={setModal} update={update} showToast={showToast} role={role} currentUser={currentUser}
-                events={activeGroup.events.filter((e) => e.type === "Bank" && e.kind === "paid")} kind="paid" />
+              {eventsState.loading && !eventsState.data ? <LoadingCard /> : (
+                <>
+                  <FundGroupSection title="External loans received" icon={ArrowDownCircle} tone="forest" setModal={setModal} update={update} showToast={showToast} role={role} currentUser={currentUser} actor={actor}
+                    events={events.filter((e) => e.type === "External Loan" && e.kind === "received")} kind="received" />
+                  <FundGroupSection title="External loans paid" icon={ArrowUpCircle} tone="rust" setModal={setModal} update={update} showToast={showToast} role={role} currentUser={currentUser} actor={actor}
+                    events={events.filter((e) => e.type === "External Loan" && e.kind === "paid")} kind="paid" />
+                  <FundGroupSection title="Money from the bank" icon={ArrowDownCircle} tone="forest" setModal={setModal} update={update} showToast={showToast} role={role} currentUser={currentUser} actor={actor}
+                    events={events.filter((e) => e.type === "Bank" && e.kind === "received")} kind="received" />
+                  <FundGroupSection title="Money from the bank paid" icon={ArrowUpCircle} tone="rust" setModal={setModal} update={update} showToast={showToast} role={role} currentUser={currentUser} actor={actor}
+                    events={events.filter((e) => e.type === "Bank" && e.kind === "paid")} kind="paid" />
+                  {eventsState.data?.truncated && (
+                    <div style={{ fontSize: 13.5, color: C.ink3 }}>Showing the most recent entries in this period.</div>
+                  )}
+                </>
+              )}
             </div>
           )}
         </>
@@ -1950,7 +1840,7 @@ function ExternalFunding({ data, setModal, update, showToast, role, currentUser 
   );
 }
 
-function FundGroupSection({ title, icon: Icon, tone, events, setModal, update, showToast, role, currentUser }) {
+function FundGroupSection({ title, icon: Icon, tone, events, setModal, update, showToast, role, currentUser, actor }) {
   const total = events.reduce((s, e) => s + e.amount, 0);
 
   const editEvent = (e) => {
@@ -1961,14 +1851,14 @@ function FundGroupSection({ title, icon: Icon, tone, events, setModal, update, s
   const deleteEvent = (e) => {
     if (e.kind === "received") {
       confirmOrRequestDelete({
-        role, currentUser, update, showToast, setModal,
+        role, currentUser, update, showToast, setModal, actor,
         entityType: "fund", entityId: e.fund.id, entityLabel: `funding record from "${e.fund.source}" (${fmt(e.amount)})`,
         title: "Delete funding record",
         message: `Permanently delete the ${fmt(e.amount)} received from "${e.fund.source}"? Any repayments recorded against it will remain but no longer be linked to a source. This cannot be undone.`,
       });
     } else {
       confirmOrRequestDelete({
-        role, currentUser, update, showToast, setModal,
+        role, currentUser, update, showToast, setModal, actor,
         entityType: "fundRepayment", entityId: e.repayment.id, entityLabel: `repayment of ${fmt(e.amount)} to "${e.fund.source}"`,
         title: "Delete repayment",
         message: `Permanently delete this repayment of ${fmt(e.amount)} to "${e.fund.source}"? This cannot be undone.`,
@@ -2068,17 +1958,14 @@ const RECORD_STYLE = `
   @media print { body { padding: 0; } }
 `;
 
-function loanRecordHTML(data, loan) {
-  const borrower = data.borrowers.find((b) => b.id === loan.borrowerId);
-  const payments = data.payments.filter((p) => p.loanId === loan.id).sort((a, b) => new Date(a.date) - new Date(b.date));
-  const collateral = data.collateral.filter((c) => c.loanId === loan.id);
-  const paid = paidAmountFor(loan.id, data.payments);
-  const outstanding = Math.max(0, loan.totalPayable - paid);
-  const outstandingNoInterest = Math.max(0, loan.amount - principalPaidFor(loan.id, data.payments));
-  const status = loanStatus(loan, data.payments);
+function loanRecordHTML(businessName, record) {
+  const { loan, borrower, payments, collateral } = record;
+  const outstanding = loan.outstanding;
+  const outstandingNoInterest = loan.outstandingNoInterest;
+  const status = loan.status || "";
 
   return `<!doctype html><html><head><title>Loan ${escapeHtml(loan.loanNumber)}</title><style>${RECORD_STYLE}</style></head><body>
-    <h1>${escapeHtml(data.settings.businessName)}</h1>
+    <h1>${escapeHtml(businessName)}</h1>
     <div class="sub">Loan record, printed ${escapeHtml(new Date().toLocaleString())}</div>
     <h2>${escapeHtml(loan.loanNumber)}<span class="status">${escapeHtml(status)}</span></h2>
     <table>
@@ -2108,22 +1995,19 @@ function loanRecordHTML(data, loan) {
   </body></html>`;
 }
 
-function downloadLoanRecordCSV(data, loan) {
-  const borrower = data.borrowers.find((b) => b.id === loan.borrowerId);
-  const payments = data.payments.filter((p) => p.loanId === loan.id).sort((a, b) => new Date(a.date) - new Date(b.date));
-  const collateral = data.collateral.filter((c) => c.loanId === loan.id);
-  const paid = paidAmountFor(loan.id, data.payments);
-  const outstanding = Math.max(0, loan.totalPayable - paid);
-  const outstandingNoInterest = Math.max(0, loan.amount - principalPaidFor(loan.id, data.payments));
+function downloadLoanRecordCSV(businessName, record) {
+  const { loan, borrower, payments, collateral } = record;
+  const outstanding = loan.outstanding;
+  const outstandingNoInterest = loan.outstandingNoInterest;
 
   const rows = [];
-  rows.push([data.settings.businessName]);
+  rows.push([businessName]);
   rows.push([`Loan record for ${loan.loanNumber}, printed ${new Date().toLocaleString()}`]);
   rows.push([]);
   rows.push(["Borrower", borrower?.fullName || "Unknown"]);
   rows.push(["Phone", borrower?.phone || ""]);
   rows.push(["National ID", borrower?.nationalId || ""]);
-  rows.push(["Status", loanStatus(loan, data.payments)]);
+  rows.push(["Status", loan.status || ""]);
   rows.push(["Principal", fmt(loan.amount)]);
   rows.push(["Interest margin", loan.interestType === "Percent" ? `${loan.interestValue}%` : fmt(loan.interestValue)]);
   rows.push(["Paperwork cost", loan.paperworkFee > 0 ? fmt(loan.paperworkFee) : "Not charged"]);
@@ -2145,15 +2029,13 @@ function downloadLoanRecordCSV(data, loan) {
   downloadBlob(csv, "text/csv;charset=utf-8;", `loan-${loan.loanNumber}.csv`);
 }
 
-function borrowerRecordHTML(data, borrower) {
-  const loans = data.loans.filter((l) => l.borrowerId === borrower.id).sort((a, b) => new Date(b.issueDate) - new Date(a.issueDate));
-  const collateral = data.collateral.filter((c) => c.borrowerId === borrower.id);
-  const payments = data.payments.filter((p) => p.borrowerId === borrower.id && !p.voided).sort((a, b) => new Date(a.date) - new Date(b.date));
-  const outstanding = loans.filter((l) => !l.voided && !l.renewed).reduce((s, l) => s + Math.max(0, l.totalPayable - paidAmountFor(l.id, data.payments)), 0);
-  const outstandingNoInterest = loans.filter((l) => !l.voided && !l.renewed).reduce((s, l) => s + Math.max(0, l.amount - principalPaidFor(l.id, data.payments)), 0);
+function borrowerRecordHTML(businessName, statement) {
+  const { borrower, loans, collateral, payments, summary } = statement;
+  const outstanding = summary.outstanding;
+  const outstandingNoInterest = summary.outstandingNoInterest;
 
   return `<!doctype html><html><head><title>${escapeHtml(borrower.fullName)} history</title><style>${RECORD_STYLE}</style></head><body>
-    <h1>${escapeHtml(data.settings.businessName)}</h1>
+    <h1>${escapeHtml(businessName)}</h1>
     <div class="sub">Borrower history, printed ${escapeHtml(new Date().toLocaleString())}</div>
     <h2>${escapeHtml(borrower.fullName)}</h2>
     <table>
@@ -2171,7 +2053,7 @@ function borrowerRecordHTML(data, borrower) {
     <h2>Loan history</h2>
     <table><tr><th>Loan</th><th>Issued</th><th>Due</th><th>Principal</th><th>Total payable</th><th>Status</th></tr>
       ${loans.length === 0 ? `<tr><td colspan="6">No loans on file</td></tr>` :
-        loans.map((l) => `<tr><td>${escapeHtml(l.loanNumber)}</td><td>${escapeHtml(l.issueDate)}</td><td>${escapeHtml(l.dueDate)}</td><td>${escapeHtml(fmt(l.amount))}</td><td>${escapeHtml(fmt(l.totalPayable))}</td><td>${escapeHtml(loanStatus(l, data.payments))}</td></tr>`).join("")}
+        loans.map((l) => `<tr><td>${escapeHtml(l.loanNumber)}</td><td>${escapeHtml(l.issueDate)}</td><td>${escapeHtml(l.dueDate)}</td><td>${escapeHtml(fmt(l.amount))}</td><td>${escapeHtml(fmt(l.totalPayable))}</td><td>${escapeHtml(l.status || "")}</td></tr>`).join("")}
     </table>
     <h2>Security / collateral</h2>
     <table><tr><th>Description</th><th>Category</th><th>Value</th><th>Status</th></tr>
@@ -2181,20 +2063,18 @@ function borrowerRecordHTML(data, borrower) {
     <h2>Payment history</h2>
     <table><tr><th>Date</th><th>Loan</th><th>Method</th><th>Total</th></tr>
       ${payments.length === 0 ? `<tr><td colspan="4">No payments recorded</td></tr>` :
-        payments.map((p) => { const l = data.loans.find((x) => x.id === p.loanId); return `<tr><td>${escapeHtml(p.date)}</td><td>${escapeHtml(l?.loanNumber || "")}</td><td>${escapeHtml(p.method)}</td><td>${escapeHtml(fmt(p.amount))}</td></tr>`; }).join("")}
+        payments.map((p) => `<tr><td>${escapeHtml(p.date)}</td><td>${escapeHtml(p.loanNumber || "")}</td><td>${escapeHtml(p.method)}</td><td>${escapeHtml(fmt(p.amount))}</td></tr>`).join("")}
     </table>
   </body></html>`;
 }
 
-function downloadBorrowerRecordCSV(data, borrower) {
-  const loans = data.loans.filter((l) => l.borrowerId === borrower.id).sort((a, b) => new Date(b.issueDate) - new Date(a.issueDate));
-  const collateral = data.collateral.filter((c) => c.borrowerId === borrower.id);
-  const payments = data.payments.filter((p) => p.borrowerId === borrower.id && !p.voided).sort((a, b) => new Date(a.date) - new Date(b.date));
-  const outstanding = loans.filter((l) => !l.voided && !l.renewed).reduce((s, l) => s + Math.max(0, l.totalPayable - paidAmountFor(l.id, data.payments)), 0);
-  const outstandingNoInterest = loans.filter((l) => !l.voided && !l.renewed).reduce((s, l) => s + Math.max(0, l.amount - principalPaidFor(l.id, data.payments)), 0);
+function downloadBorrowerRecordCSV(businessName, statement) {
+  const { borrower, loans, collateral, payments, summary } = statement;
+  const outstanding = summary.outstanding;
+  const outstandingNoInterest = summary.outstandingNoInterest;
 
   const rows = [];
-  rows.push([data.settings.businessName]);
+  rows.push([businessName]);
   rows.push([`Borrower history for ${borrower.fullName}, printed ${new Date().toLocaleString()}`]);
   rows.push([]);
   rows.push(["Phone", borrower.phone || ""]);
@@ -2210,7 +2090,7 @@ function downloadBorrowerRecordCSV(data, borrower) {
   rows.push([]);
   rows.push(["Loan history"]);
   rows.push(["Loan", "Issued", "Due", "Principal", "Total payable", "Status"]);
-  loans.forEach((l) => rows.push([l.loanNumber, l.issueDate, l.dueDate, fmt(l.amount), fmt(l.totalPayable), loanStatus(l, data.payments)]));
+  loans.forEach((l) => rows.push([l.loanNumber, l.issueDate, l.dueDate, fmt(l.amount), fmt(l.totalPayable), l.status || ""]));
   rows.push([]);
   rows.push(["Security / collateral"]);
   rows.push(["Description", "Category", "Value", "Status"]);
@@ -2218,26 +2098,28 @@ function downloadBorrowerRecordCSV(data, borrower) {
   rows.push([]);
   rows.push(["Payment history"]);
   rows.push(["Date", "Loan", "Method", "Total"]);
-  payments.forEach((p) => { const l = data.loans.find((x) => x.id === p.loanId); rows.push([p.date, l?.loanNumber || "", p.method, fmt(p.amount)]); });
+  payments.forEach((p) => rows.push([p.date, p.loanNumber || "", p.method, fmt(p.amount)]));
 
   const csv = rows.map((r) => r.map(csvEscape).join(",")).join("\n");
   downloadBlob(csv, "text/csv;charset=utf-8;", `borrower-${borrower.fullName.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.csv`);
 }
 
-function Reports({ data }) {
-  const { borrowers, loans, payments, expenses } = data;
-  const totals = loanTotals(loans, payments);
-  const totalCosts = expenses.filter(e=>!e.voided).reduce((s, e) => s + Number(e.amount), 0);
-  const netPosition = (totals.totalCollected - totals.totalLent) - totalCosts;
-  const fullyPaid = loans.filter((l) => !l.voided && loanStatus(l, payments) === "Fully Paid").length;
-  const byCategory = {};
-  expenses.filter(e=>!e.voided).forEach((e) => { byCategory[e.category] = (byCategory[e.category] || 0) + Number(e.amount); });
-  const categoryRows = Object.entries(byCategory).sort((a, b) => b[1] - a[1]);
+function Reports({ boot, version }) {
+  const { loading, data, error } = useServerData(() => api().reports.summary(), [version]);
+  if (loading && !data) return <LoadingCard />;
+  if (error) return <ErrorCard error={error} />;
+  if (!data) return null;
+
+  const businessName = boot?.settings?.businessName || "Ledger";
+  const totals = data;
+  const totalCosts = totals.totalCosts;
+  const netPosition = totals.netPosition;
+  const categoryRows = totals.categoryRows || [];
 
   const summaryCards = [
-    ["Borrowers on file", borrowers.length],
-    ["Loans issued", loans.filter(l=>!l.voided).length],
-    ["Loans fully paid", fullyPaid],
+    ["Borrowers on file", totals.borrowerCount],
+    ["Loans issued", totals.loanCount],
+    ["Loans fully paid", totals.fullyPaid],
     ["Overdue loans", totals.overdueCount],
     ["Total lent", fmt(totals.totalLent)],
     ["Total collected", fmt(totals.totalCollected)],
@@ -2246,11 +2128,11 @@ function Reports({ data }) {
   ];
   const summaryExportRows = [...summaryCards, ["Net position", (netPosition >= 0 ? "+" : "-") + fmt(Math.abs(netPosition))]];
 
-  const reportFileBase = `report-${data.settings.businessName.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${todayISO()}`;
+  const reportFileBase = `report-${businessName.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${todayISO()}`;
 
   const downloadCSV = () => {
     const rows = [];
-    rows.push([data.settings.businessName]);
+    rows.push([businessName]);
     rows.push([`Report generated ${new Date().toLocaleString()}`]);
     rows.push([]);
     rows.push(["Summary"]);
@@ -2274,7 +2156,7 @@ function Reports({ data }) {
   };
 
   const downloadPDF = () => {
-    const html = `<!doctype html><html><head><title>${escapeHtml(data.settings.businessName)} report</title>
+    const html = `<!doctype html><html><head><title>${escapeHtml(businessName)} report</title>
       <style>
         body { font-family: 'Times New Roman', Times, serif; padding: 32px; color: #20291F; }
         h1 { font-size: 22px; margin: 0 0 2px; }
@@ -2286,7 +2168,7 @@ function Reports({ data }) {
         @media print { body { padding: 0; } }
       </style>
       </head><body>
-      <h1>${escapeHtml(data.settings.businessName)}</h1>
+      <h1>${escapeHtml(businessName)}</h1>
       <div class="sub">Report generated ${escapeHtml(new Date().toLocaleString())}</div>
       <h2>Summary</h2>
       <table><tr><th>Metric</th><th>Value</th></tr>
@@ -2332,7 +2214,7 @@ function Reports({ data }) {
                 <span>{cat}</span><span style={{ ...numFont, fontWeight: 600 }}>{fmt(amt)}</span>
               </div>
               <div style={{ height: 6, background: C.bg, borderRadius: 4, overflow: "hidden" }}>
-                <div style={{ height: "100%", width: `${Math.min(100, (amt / totalCosts) * 100)}%`, background: C.brass }} />
+                <div style={{ height: "100%", width: `${Math.min(100, totalCosts > 0 ? (amt / totalCosts) * 100 : 0)}%`, background: C.brass }} />
               </div>
             </div>
           ))}
@@ -2344,42 +2226,93 @@ function Reports({ data }) {
 
 /* --------------------------------- settings --------------------------------- */
 
-function SettingsPage({ data, update, showToast, t }) {
-  const [name, setName] = useState(data.settings.businessName);
-  const [startingBalance, setStartingBalance] = useState(String(data.settings.startingCashBalance ?? 0));
-  const fileInputRef = useRef(null);
+function SettingsPage({ boot, update, showToast, t, actor }) {
+  const settings = boot?.settings || {};
+  const [name, setName] = useState(settings.businessName || "My Lending Business");
+  const [startingBalance, setStartingBalance] = useState(String(settings.startingCashBalance ?? 0));
+  const [saving, setSaving] = useState(false);
+  const [backupInfo, setBackupInfo] = useState(null);
+  const [busy, setBusy] = useState("");
 
-  const exportData = () => {
-    const payload = JSON.stringify(data, null, 2);
-    const base = data.settings.businessName.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
-    downloadBlob(payload, "application/json", `ledger-backup-${base}-${todayISO()}.json`);
-    showToast("Backup downloaded.");
+  const loadBackupInfo = useCallback(async () => {
+    try {
+      setBackupInfo(await window.ledger.backup.info());
+    } catch (e) {
+      /* the backup panel just stays empty if the main process can't report */
+    }
+  }, []);
+
+  useEffect(() => { loadBackupInfo(); }, [loadBackupInfo]);
+
+  const saveSettings = async () => {
+    if (saving) return;
+    setSaving(true);
+    try {
+      const result = await api().settingsUpdate({
+        actor,
+        settings: { businessName: name, startingCashBalance: Number(startingBalance) || 0 },
+      });
+      if (!result?.ok) return showToast(result?.error || "Could not save settings.");
+      showToast("Settings saved.");
+      update();
+    } catch (e) {
+      showToast(e.message || "Could not save settings.");
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const triggerImport = () => fileInputRef.current?.click();
-
-  const handleImportFile = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const parsed = JSON.parse(reader.result);
-        if (!parsed || !Array.isArray(parsed.borrowers) || !Array.isArray(parsed.loans) || !Array.isArray(parsed.users)) {
-          showToast("That file doesn't look like a Ledger backup.");
-          return;
-        }
-        if (!window.confirm("This will REPLACE all current data in Ledger with the contents of this backup file. This cannot be undone. Continue?")) return;
-        update((d) => { Object.assign(d, parsed); }, `Restored data from backup file "${file.name}"`);
-        showToast("Backup restored. Reloading…");
-        setTimeout(() => window.location.reload(), 800);
-      } catch (err) {
-        showToast("Couldn't read that file, make sure it's a valid Ledger backup (.json).");
-      }
-    };
-    reader.readAsText(file);
-    e.target.value = "";
+  const exportData = async () => {
+    if (busy) return;
+    setBusy("export");
+    try {
+      const result = await window.ledger.backup.exportFile();
+      if (result?.canceled) return;
+      if (!result?.ok) return showToast(result?.error || "Could not create that backup.");
+      showToast("Backup saved.");
+      loadBackupInfo();
+    } catch (e) {
+      showToast(e.message || "Could not create that backup.");
+    } finally {
+      setBusy("");
+    }
   };
+
+  const backupNow = async () => {
+    if (busy) return;
+    setBusy("now");
+    try {
+      const result = await window.ledger.backup.now();
+      if (!result?.ok) return showToast(result?.error || "Could not create a recovery point.");
+      showToast("Recovery point created.");
+      loadBackupInfo();
+    } catch (e) {
+      showToast(e.message || "Could not create a recovery point.");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const restoreData = async () => {
+    if (busy) return;
+    if (!window.confirm("Restoring a backup REPLACES everything currently in Ledger with the contents of the file you choose. This cannot be undone. Continue?")) return;
+    setBusy("restore");
+    try {
+      const result = await window.ledger.backup.restoreFile();
+      if (result?.canceled) return;
+      if (!result?.ok) return showToast(result?.error || "Could not restore that backup.");
+      showToast("Backup restored. Reloading…");
+      setTimeout(() => window.location.reload(), 900);
+    } catch (e) {
+      showToast(e.message || "Could not restore that backup.");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const lastBackup = backupInfo?.lastBackupAt
+    ? new Date(backupInfo.lastBackupAt).toLocaleString()
+    : "No automatic backup yet";
 
   return (
     <div>
@@ -2391,22 +2324,27 @@ function SettingsPage({ data, update, showToast, t }) {
         <Field label="Starting cash balance" hint="The cash on hand before you started using this system. Daily opening balances build from this figure.">
           <input type="number" style={FieldStyle.input} value={startingBalance} onChange={(e) => setStartingBalance(e.target.value)} />
         </Field>
-        <button style={{ ...Btn.primary, marginTop: 10 }} onClick={() => {
-          update((d) => { d.settings.businessName = name; d.settings.startingCashBalance = Number(startingBalance) || 0; }, "Updated business settings");
-          showToast("Settings saved.");
-        }}>Save changes</button>
+        <button style={{ ...Btn.primary, marginTop: 10, opacity: saving ? 0.7 : 1 }} disabled={saving} onClick={saveSettings}>
+          {saving ? "Saving…" : "Save changes"}
+        </button>
       </Card>
 
-      <Card style={{ maxWidth: 460, marginBottom: 14 }}>
+      <Card style={{ maxWidth: 520, marginBottom: 14 }}>
         <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 4 }}>Backup &amp; restore</div>
         <div style={{ fontSize: 14, color: C.ink3, lineHeight: 1.55, marginBottom: 12 }}>
-          Download a complete, portable copy of everything in Ledger, borrowers, loans, payments, users, settings, all of it, as one file you control. This is also the right way to move Ledger to a new computer: the data file on disk is encrypted to this Windows account, so copying it directly won't open elsewhere, but a backup file downloaded here will restore anywhere.
+          Download a complete, portable copy of everything in Ledger (borrowers, loans, payments, users, settings) as one readable JSON file you control. This is also the right way to move Ledger to a new computer: the database on disk is encrypted to this computer, so copying it directly won't open elsewhere, but a backup file downloaded here will restore anywhere.
+        </div>
+        <div style={{ background: C.bg, borderRadius: 8, padding: "10px 12px", fontSize: 13.5, color: C.ink2, marginBottom: 12 }}>
+          <div>Automatic recovery points: <b>{backupInfo?.files?.length ?? 0}</b></div>
+          <div>Last backup: <b>{lastBackup}</b></div>
+          {backupInfo?.backupsDir && <div style={{ marginTop: 4, wordBreak: "break-all", color: C.ink3 }}>{backupInfo.backupsDir}</div>}
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button style={Btn.secondary} onClick={exportData}><Download size={14} /> Download full backup</button>
-          <button style={Btn.secondary} onClick={triggerImport}><RefreshCw size={14} /> Restore from backup file</button>
+          <button style={Btn.secondary} disabled={!!busy} onClick={exportData}><Download size={14} /> Download full backup</button>
+          <button style={Btn.secondary} disabled={!!busy} onClick={backupNow}><RefreshCw size={14} /> Create recovery point</button>
+          <button style={Btn.secondary} disabled={!!busy} onClick={restoreData}><RefreshCw size={14} /> Restore from backup file</button>
+          <button style={Btn.ghost} onClick={() => window.ledger.backup.openFolder("backups")}>Open backups folder</button>
         </div>
-        <input ref={fileInputRef} type="file" accept="application/json,.json" style={{ display: "none" }} onChange={handleImportFile} />
         <div style={{ fontSize: 13, color: C.rust, marginTop: 10 }}>
           Restoring replaces everything currently in Ledger with the contents of the file you choose. It can't be undone, so only use it to recover from a real backup.
         </div>
@@ -2421,7 +2359,7 @@ function SettingsPage({ data, update, showToast, t }) {
 
 /* ---------------------------------- users & login ----------------------------------- */
 
-function LoginScreen({ data, onLogin }) {
+function LoginScreen({ businessName, onLogin }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -2429,15 +2367,24 @@ function LoginScreen({ data, onLogin }) {
 
   const submit = async () => {
     if (checking) return;
-    const u = data.users.find((x) => x.username.toLowerCase() === username.trim().toLowerCase());
-    if (!u) { setError("Incorrect username or password."); return; }
+    if (!username.trim() || !password) {
+      setError("Incorrect username or password.");
+      return;
+    }
     setChecking(true);
-    const ok = await verifyPassword(password, u.passwordSalt, u.passwordHash);
-    setChecking(false);
-    if (!ok) { setError("Incorrect username or password."); return; }
-    if (!u.active) { setError("This account has been deactivated. Contact your administrator."); return; }
-    setError("");
-    onLogin(u);
+    try {
+      const result = await api().auth.login({ username, password });
+      if (!result?.ok) {
+        setError(result?.error || "Incorrect username or password.");
+        return;
+      }
+      setError("");
+      onLogin(result.user);
+    } catch (e) {
+      setError(e.message || "Could not sign in.");
+    } finally {
+      setChecking(false);
+    }
   };
 
   const onKeyDown = (e) => { if (e.key === "Enter") submit(); };
@@ -2455,7 +2402,7 @@ function LoginScreen({ data, onLogin }) {
       }}>
         <div style={{ textAlign: "center", marginBottom: 22 }}>
           <div style={{ ...displayFont, fontSize: 30, fontWeight: 600, color: C.forestDark }}>Ledger</div>
-          <div style={{ fontSize: 15, color: C.ink3, marginTop: 4 }}>Sign in to open the books.</div>
+          <div style={{ fontSize: 15, color: C.ink3, marginTop: 4 }}>{businessName || "Sign in to open the books."}</div>
         </div>
         <Field label="Username">
           <input style={FieldStyle.input} value={username} onChange={(e) => setUsername(e.target.value)} onKeyDown={onKeyDown} autoFocus />
@@ -2470,19 +2417,22 @@ function LoginScreen({ data, onLogin }) {
   );
 }
 
-function UsersPage({ data, update, showToast, currentUser, setModal, role }) {
-  const users = [...data.users].sort((a, b) => a.username.localeCompare(b.username));
+function UsersPage({ update, showToast, currentUser, setModal, role, actor, version }) {
+  const { loading, data, error } = useServerData(() => api().users.list(), [version]);
+  const users = data || [];
 
-  const toggleActive = (u) => {
+  const toggleActive = async (u) => {
     if (u.username === "admin") return showToast("The default administrator account can't be deactivated.");
-    update((d) => { d.users.find((x) => x.id === u.id).active = !u.active; }, `${u.active ? "Deactivated" : "Reactivated"} user account "${u.username}"`);
+    const result = await api().users.setActive({ actor, id: u.id, active: !u.active });
+    if (!result?.ok) return showToast(result?.error || "Could not update this account.");
     showToast(u.active ? "User deactivated." : "User reactivated.");
+    update();
   };
 
   const deleteUser = (u) => {
     if (u.username === "admin") return showToast("The default administrator account can't be deleted.");
     confirmOrRequestDelete({
-      role, currentUser, update, showToast, setModal,
+      role, currentUser, update, showToast, setModal, actor,
       entityType: "user", entityId: u.id, entityLabel: `user account "${u.username}"`,
       title: "Delete user permanently",
       message: `Permanently delete the account "${u.username}" (${u.fullName})? This removes their login entirely. Consider Deactivate instead if you just want to revoke access while keeping the record. This cannot be undone.`,
@@ -2495,36 +2445,38 @@ function UsersPage({ data, update, showToast, currentUser, setModal, role }) {
       <div style={{ fontSize: 14.5, color: C.ink3, marginBottom: 14, maxWidth: 620 }}>
         Add a login for each member of staff and choose what they're allowed to see and do. Deactivating revokes access while keeping the record and audit trail intact, use Delete only when you want the account gone entirely.
       </div>
-      <Card style={{ padding: 0, overflow: "hidden" }}>
-        {users.map((u, i) => (
-          <div key={u.id} style={{
-            display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 18px",
-            borderBottom: i < users.length - 1 ? `1px solid ${C.border}` : "none", opacity: u.active ? 1 : 0.5
-          }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <div style={{
-                width: 34, height: 34, borderRadius: "50%", background: C.forestSoft, color: C.forestDark,
-                display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, fontWeight: 700
-              }}>{u.fullName.slice(0, 1).toUpperCase()}</div>
-              <div>
-                <div style={{ fontWeight: 600, fontSize: 16 }}>{u.fullName} {u.username === "admin" && <span style={{ fontSize: 12, color: C.ink4 }}>(default admin)</span>}</div>
-                <div style={{ fontSize: 14, color: C.ink3 }}>@{u.username} · {u.role}{!u.active ? " · Inactive" : ""}</div>
+      {loading && !data ? <LoadingCard /> : error ? <ErrorCard error={error} /> : (
+        <Card style={{ padding: 0, overflow: "hidden" }}>
+          {users.map((u, i) => (
+            <div key={u.id} style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 18px",
+              borderBottom: i < users.length - 1 ? `1px solid ${C.border}` : "none", opacity: u.active ? 1 : 0.5
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <div style={{
+                  width: 34, height: 34, borderRadius: "50%", background: C.forestSoft, color: C.forestDark,
+                  display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, fontWeight: 700
+                }}>{u.fullName.slice(0, 1).toUpperCase()}</div>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 16 }}>{u.fullName} {u.username === "admin" && <span style={{ fontSize: 12, color: C.ink4 }}>(default admin)</span>}</div>
+                  <div style={{ fontSize: 14, color: C.ink3 }}>@{u.username} · {u.role}{!u.active ? " · Inactive" : ""}</div>
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <button style={Btn.ghost} onClick={() => setModal({ type: "user", payload: u })}><Edit2 size={13} /> Edit</button>
+                {u.id !== currentUser.id && (
+                  <button style={u.active ? Btn.danger : Btn.secondary} onClick={() => toggleActive(u)}>
+                    {u.active ? <><Ban size={13} /> Deactivate</> : <><CheckCircle2 size={13} /> Reactivate</>}
+                  </button>
+                )}
+                {u.id !== currentUser.id && u.username !== "admin" && (
+                  <button style={{ ...Btn.ghost, color: C.rust }} onClick={() => deleteUser(u)}><Ban size={13} /> Delete</button>
+                )}
               </div>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <button style={Btn.ghost} onClick={() => setModal({ type: "user", payload: u })}><Edit2 size={13} /> Edit</button>
-              {u.id !== currentUser.id && (
-                <button style={u.active ? Btn.danger : Btn.secondary} onClick={() => toggleActive(u)}>
-                  {u.active ? <><Ban size={13} /> Deactivate</> : <><CheckCircle2 size={13} /> Reactivate</>}
-                </button>
-              )}
-              {u.id !== currentUser.id && u.username !== "admin" && (
-                <button style={{ ...Btn.ghost, color: C.rust }} onClick={() => deleteUser(u)}><Ban size={13} /> Delete</button>
-              )}
-            </div>
-          </div>
-        ))}
-      </Card>
+          ))}
+        </Card>
+      )}
 
       <div style={{ marginTop: 20, fontWeight: 700, fontSize: 14.5, textTransform: "uppercase", letterSpacing: 0.4, color: C.ink3, marginBottom: 10 }}>Privilege levels</div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: 12 }}>
@@ -2539,18 +2491,19 @@ function UsersPage({ data, update, showToast, currentUser, setModal, role }) {
   );
 }
 
-function AuditLogPage({ data }) {
+function AuditLogPage({ version }) {
   const [q, setQ] = useState("");
+  const search = useDebounced(q, 250);
   const [userFilter, setUserFilter] = useState("All");
+  const [page, setPage] = usePageState();
+  const { loading, data, error } = useServerData(
+    () => api().audit.page({ page, q: search, user: userFilter, limit: 60 }),
+    [page, search, userFilter, version]
+  );
+  useEffect(() => { setPage(1); }, [search, userFilter]);
 
-  const log = [...(data.auditLog || [])].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-  const usernames = ["All", ...Array.from(new Set(log.map((e) => e.username))).sort()];
-
-  const filtered = log.filter((e) => {
-    if (userFilter !== "All" && e.username !== userFilter) return false;
-    if (q && !e.action.toLowerCase().includes(q.toLowerCase())) return false;
-    return true;
-  });
+  const log = data?.items || [];
+  const usernames = ["All", ...(data?.usernames || [])];
 
   let lastDay = null;
 
@@ -2568,67 +2521,66 @@ function AuditLogPage({ data }) {
         </select>
       </div>
 
-      {filtered.length === 0 ? (
+      {loading && !data ? <LoadingCard /> : error ? <ErrorCard error={error} /> : log.length === 0 ? (
         <Card><EmptyState icon={History} title="No matching activity" sub="Actions taken across the system will appear here as they happen." /></Card>
       ) : (
-        <Card style={{ padding: 0, overflow: "hidden" }}>
-          {filtered.map((e, i) => {
-            const d = new Date(e.timestamp);
-            const dayLabel = d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
-            const showDayHeader = dayLabel !== lastDay;
-            lastDay = dayLabel;
-            return (
-              <React.Fragment key={e.id}>
-                {showDayHeader && (
-                  <div style={{ padding: "9px 18px", background: C.bg, fontSize: 12.5, fontWeight: 700, color: C.ink3, textTransform: "uppercase", letterSpacing: 0.3 }}>
-                    {dayLabel}
+        <>
+          <Card style={{ padding: 0, overflow: "hidden" }}>
+            {log.map((e, i) => {
+              const d = new Date(e.timestamp);
+              const dayLabel = d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+              const showDayHeader = dayLabel !== lastDay;
+              lastDay = dayLabel;
+              return (
+                <React.Fragment key={e.id}>
+                  {showDayHeader && (
+                    <div style={{ padding: "9px 18px", background: C.bg, fontSize: 12.5, fontWeight: 700, color: C.ink3, textTransform: "uppercase", letterSpacing: 0.3 }}>
+                      {dayLabel}
+                    </div>
+                  )}
+                  <div style={{
+                    display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 14, padding: "12px 18px",
+                    borderTop: showDayHeader ? "none" : `1px solid ${C.border}`
+                  }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 15, fontWeight: 500 }}>{e.action}</div>
+                      <div style={{ fontSize: 13, color: C.ink3, marginTop: 3, ...numFont }}>{e.username}</div>
+                    </div>
+                    <div style={{ fontSize: 13, color: C.ink4, ...numFont, whiteSpace: "nowrap" }}>{formatTime(e.timestamp)}</div>
                   </div>
-                )}
-                <div style={{
-                  display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 14, padding: "12px 18px",
-                  borderTop: showDayHeader ? "none" : `1px solid ${C.border}`
-                }}>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 15, fontWeight: 500 }}>{e.action}</div>
-                    <div style={{ fontSize: 13, color: C.ink3, marginTop: 3, ...numFont }}>{e.username}</div>
-                  </div>
-                  <div style={{ fontSize: 13, color: C.ink4, ...numFont, whiteSpace: "nowrap" }}>{formatTime(e.timestamp)}</div>
-                </div>
-              </React.Fragment>
-            );
-          })}
-        </Card>
+                </React.Fragment>
+              );
+            })}
+          </Card>
+          <Pager page={data.page} pageCount={data.pageCount} total={data.total} onPage={setPage} />
+        </>
       )}
     </div>
   );
 }
 
-function ApprovalsPage({ data, update, showToast, currentUser }) {
-  const requests = [...(data.deletionRequests || [])].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  const pending = requests.filter((r) => r.status === "pending");
-  const resolved = requests.filter((r) => r.status !== "pending");
+function ApprovalsPage({ update, showToast, actor, version }) {
+  const { loading, data, error } = useServerData(() => api().approvals.page(), [version]);
+  const pending = data?.pending || [];
+  const resolved = data?.resolved || [];
 
-  const approve = (req) => {
+  const approve = async (req) => {
     if (!window.confirm(`Approve this deletion: ${req.entityLabel}? This will permanently delete it and cannot be undone.`)) return;
-    update((d) => {
-      const r = d.deletionRequests.find((x) => x.id === req.id);
-      executeDeletionRequest(d, r);
-      r.status = "approved";
-      r.resolvedAt = new Date().toISOString();
-      r.resolvedBy = currentUser.username;
-    }, `Approved deletion request: ${req.entityLabel}`);
+    const result = await api().approvals.approve({ actor, id: req.id });
+    if (!result?.ok) return showToast(result?.error || "Could not approve this request.");
     showToast("Deletion approved and completed.");
+    update();
   };
 
-  const reject = (req) => {
-    update((d) => {
-      const r = d.deletionRequests.find((x) => x.id === req.id);
-      r.status = "rejected";
-      r.resolvedAt = new Date().toISOString();
-      r.resolvedBy = currentUser.username;
-    }, `Rejected deletion request: ${req.entityLabel}`);
+  const reject = async (req) => {
+    const result = await api().approvals.reject({ actor, id: req.id });
+    if (!result?.ok) return showToast(result?.error || "Could not reject this request.");
     showToast("Deletion request rejected. Nothing was deleted.");
+    update();
   };
+
+  if (loading && !data) return <LoadingCard />;
+  if (error) return <ErrorCard error={error} />;
 
   return (
     <div>
@@ -2690,45 +2642,45 @@ function ApprovalsPage({ data, update, showToast, currentUser }) {
   );
 }
 
-function UserForm({ data, update, showToast, close, existing }) {
+function UserForm({ update, showToast, close, existing, actor }) {
   const [f, setF] = useState(existing
     ? { username: existing.username, password: "", fullName: existing.fullName, role: existing.role }
     : { username: "", password: "", fullName: "", role: "Loan Officer" });
+  const [saving, setSaving] = useState(false);
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
 
   const submit = async () => {
+    if (saving) return;
     if (!f.fullName.trim()) return showToast("Enter the user's full name.");
     if (!f.username.trim()) return showToast("Choose a username.");
-    const clash = data.users.find((u) => u.username.toLowerCase() === f.username.trim().toLowerCase() && u.id !== existing?.id);
-    if (clash) return showToast("That username is already taken.");
-
-    if (existing) {
-      let newHash = null, newSalt = null;
-      if (f.password.trim()) {
-        newSalt = randomSalt();
-        newHash = await hashPassword(f.password.trim(), newSalt);
-      }
-      update((d) => {
-        const u = d.users.find((x) => x.id === existing.id);
-        u.username = f.username.trim();
-        u.fullName = f.fullName.trim();
-        u.role = f.role;
-        if (newHash) { u.passwordHash = newHash; u.passwordSalt = newSalt; delete u.password; }
-      }, `Edited user account "${f.username.trim()}"`);
-      showToast("User updated.");
-    } else {
-      if (!f.password.trim()) return showToast("Set a password for the new user.");
-      const salt = randomSalt();
-      const hash = await hashPassword(f.password.trim(), salt);
-      update((d) => {
-        d.users.push({
-          id: uid("usr"), username: f.username.trim(), passwordHash: hash, passwordSalt: salt,
-          fullName: f.fullName.trim(), role: f.role, active: true, createdAt: todayISO()
-        });
-      }, `Added user account "${f.username.trim()}" (${f.role})`);
-      showToast("User added.");
+    if (!existing && !f.password.trim()) return showToast("Set a password for the new user.");
+    setSaving(true);
+    try {
+      const result = existing
+        ? await api().users.update({
+            actor,
+            id: existing.id,
+            username: f.username.trim(),
+            fullName: f.fullName.trim(),
+            role: f.role,
+            ...(f.password.trim() ? { password: f.password.trim() } : {}),
+          })
+        : await api().users.create({
+            actor,
+            username: f.username.trim(),
+            fullName: f.fullName.trim(),
+            role: f.role,
+            password: f.password.trim(),
+          });
+      if (!result?.ok) return showToast(result?.error || "Could not save this user.");
+      showToast(existing ? "User updated." : "User added.");
+      close();
+      update();
+    } catch (e) {
+      showToast(e.message || "Could not save this user.");
+    } finally {
+      setSaving(false);
     }
-    close();
   };
 
   return (
@@ -2746,7 +2698,7 @@ function UserForm({ data, update, showToast, close, existing }) {
       </Field>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
         <button style={Btn.secondary} onClick={close}>Cancel</button>
-        <button style={Btn.primary} onClick={submit}>{existing ? "Save changes" : "Add user"}</button>
+        <button style={Btn.primary} disabled={saving} onClick={submit}>{saving ? "Saving…" : existing ? "Save changes" : "Add user"}</button>
       </div>
     </ModalShell>
   );
@@ -2754,13 +2706,17 @@ function UserForm({ data, update, showToast, close, existing }) {
 
 /* -------------------------------- global search ------------------------------- */
 
-function SearchResults({ q, data, goBorrower, goLoan, clear }) {
-  const query = q.toLowerCase();
-  const borrowers = data.borrowers.filter((b) => [b.fullName, b.phone, b.altPhone, b.nationalId].join(" ").toLowerCase().includes(query));
-  const loans = data.loans.filter((l) => [l.loanNumber, borrowerName(data.borrowers, l.borrowerId)].join(" ").toLowerCase().includes(query));
-  const payments = data.payments.filter((p) => [p.reference, borrowerName(data.borrowers, p.borrowerId)].join(" ").toLowerCase().includes(query));
-  const collateral = data.collateral.filter((c) => [c.description, c.category, borrowerName(data.borrowers, c.borrowerId)].join(" ").toLowerCase().includes(query));
-  const nothing = borrowers.length + loans.length + payments.length + collateral.length === 0;
+function SearchResults({ q, goBorrower, goLoan, clear, version }) {
+  const search = useDebounced(q, 250);
+  const { loading, data, error } = useServerData(
+    () => api().search(search),
+    [search, version]
+  );
+  const borrowers = data?.borrowers || [];
+  const loans = data?.loans || [];
+  const payments = data?.payments || [];
+  const collateral = data?.collateral || [];
+  const nothing = !loading && borrowers.length + loans.length + payments.length + collateral.length === 0;
 
   return (
     <div>
@@ -2768,6 +2724,8 @@ function SearchResults({ q, data, goBorrower, goLoan, clear }) {
         <div style={{ fontSize: 15.5, color: C.ink3 }}>Results for "<b>{q}</b>"</div>
         <button style={Btn.ghost} onClick={clear}><X size={13} /> Clear</button>
       </div>
+      {loading && !data && <LoadingCard />}
+      {error && <ErrorCard error={error} />}
       {nothing && <Card><EmptyState icon={Search} title="No matches found" sub="Try a different name, phone number, or loan number." /></Card>}
       {borrowers.length > 0 && (
         <ResultGroup title="Borrowers" items={borrowers.map((b) => ({
@@ -2776,17 +2734,17 @@ function SearchResults({ q, data, goBorrower, goLoan, clear }) {
       )}
       {loans.length > 0 && (
         <ResultGroup title="Loans" items={loans.map((l) => ({
-          key: l.id, title: l.loanNumber, sub: `${borrowerName(data.borrowers, l.borrowerId)} · ${fmt(l.amount)}`, onClick: () => goLoan(l.id)
+          key: l.id, title: l.loanNumber, sub: `${l.borrowerName || "Unknown borrower"} · ${fmt(l.amount)}`, onClick: () => goLoan(l.id)
         }))} />
       )}
       {payments.length > 0 && (
         <ResultGroup title="Payments" items={payments.map((p) => ({
-          key: p.id, title: fmt(p.amount), sub: `${borrowerName(data.borrowers, p.borrowerId)} · ${p.date}`, onClick: () => goLoan(p.loanId)
+          key: p.id, title: fmt(p.amount), sub: `${p.borrowerName || "Unknown borrower"} · ${p.date}`, onClick: () => goLoan(p.loanId)
         }))} />
       )}
       {collateral.length > 0 && (
         <ResultGroup title="Collateral" items={collateral.map((c) => ({
-          key: c.id, title: c.description, sub: `${borrowerName(data.borrowers, c.borrowerId)} · ${c.category}`, onClick: () => goLoan(c.loanId)
+          key: c.id, title: c.description, sub: `${c.borrowerName || "Unknown borrower"} · ${c.category}`, onClick: () => goLoan(c.loanId)
         }))} />
       )}
     </div>
@@ -2969,7 +2927,7 @@ function ModalShell({ title, onClose, children, wide }) {
 }
 
 
-function NotificationsModal({ overdueLoans, soonLoans, autoRenewedToday, data, close, goLoan }) {
+function NotificationsModal({ overdueLoans, soonLoans, autoRenewedToday, close, goLoan }) {
   const today = todayISO();
   const nothing = overdueLoans.length === 0 && soonLoans.length === 0 && autoRenewedToday.length === 0;
 
@@ -2979,7 +2937,7 @@ function NotificationsModal({ overdueLoans, soonLoans, autoRenewedToday, data, c
       borderBottom: `1px solid ${C.border}`, cursor: "pointer"
     }}>
       <div>
-        <div style={{ fontWeight: 600, fontSize: 15, color: tone || C.ink }}>{borrowerName(data.borrowers, l.borrowerId)}</div>
+        <div style={{ fontWeight: 600, fontSize: 15, color: tone || C.ink }}>{l.borrowerName || "Unknown borrower"}</div>
         <div style={{ fontSize: 13.5, color: C.ink3, ...numFont }}>{l.loanNumber} · {sub}</div>
       </div>
       <ChevronRight size={14} color={C.ink4} />
@@ -3035,18 +2993,18 @@ function NotificationsModal({ overdueLoans, soonLoans, autoRenewedToday, data, c
   );
 }
 
-function ModalRouter({ modal, close, data, update, showToast, goBorrower, goLoan, setModal, currentUser, role, t }) {
-  if (modal.type === "borrower") return <BorrowerForm data={data} update={update} showToast={showToast} close={close} existing={modal.payload} goBorrower={goBorrower} />;
-  if (modal.type === "loan") return <LoanForm data={data} update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} goLoan={goLoan} setModal={setModal} />;
-  if (modal.type === "payment") return <PaymentForm data={data} update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} />;
-  if (modal.type === "collateral") return <CollateralForm data={data} update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} t={t} />;
-  if (modal.type === "expense") return <ExpenseForm update={update} showToast={showToast} close={close} existing={modal.payload} />;
-  if (modal.type === "user") return <UserForm data={data} update={update} showToast={showToast} close={close} existing={modal.payload} />;
-  if (modal.type === "renew") return <RenewLoanForm data={data} update={update} showToast={showToast} close={close} payload={modal.payload} goLoan={goLoan} />;
-  if (modal.type === "editLoan") return <EditLoanForm data={data} update={update} showToast={showToast} close={close} payload={modal.payload} />;
-  if (modal.type === "fundReceived") return <FundReceivedForm update={update} showToast={showToast} close={close} existing={modal.payload} />;
-  if (modal.type === "fundRepayment") return <FundRepaymentForm data={data} update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} />;
-  if (modal.type === "changePassword") return <ChangePasswordForm data={data} update={update} showToast={showToast} close={close} currentUser={currentUser} />;
+function ModalRouter({ modal, close, update, showToast, goBorrower, goLoan, setModal, currentUser, role, t, actor, boot, version }) {
+  if (modal.type === "borrower") return <BorrowerForm update={update} showToast={showToast} close={close} existing={modal.payload} goBorrower={goBorrower} actor={actor} />;
+  if (modal.type === "loan") return <LoanForm update={update} showToast={showToast} close={close} payload={modal.payload} goLoan={goLoan} setModal={setModal} actor={actor} version={version} />;
+  if (modal.type === "payment") return <PaymentForm update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} actor={actor} version={version} />;
+  if (modal.type === "collateral") return <CollateralForm update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} t={t} actor={actor} version={version} />;
+  if (modal.type === "expense") return <ExpenseForm update={update} showToast={showToast} close={close} existing={modal.payload} actor={actor} />;
+  if (modal.type === "user") return <UserForm update={update} showToast={showToast} close={close} existing={modal.payload} actor={actor} />;
+  if (modal.type === "renew") return <RenewLoanForm update={update} showToast={showToast} close={close} payload={modal.payload} goLoan={goLoan} actor={actor} version={version} />;
+  if (modal.type === "editLoan") return <EditLoanForm update={update} showToast={showToast} close={close} payload={modal.payload} actor={actor} version={version} />;
+  if (modal.type === "fundReceived") return <FundReceivedForm update={update} showToast={showToast} close={close} existing={modal.payload} actor={actor} />;
+  if (modal.type === "fundRepayment") return <FundRepaymentForm update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} actor={actor} version={version} />;
+  if (modal.type === "changePassword") return <ChangePasswordForm showToast={showToast} close={close} currentUser={currentUser} />;
   if (modal.type === "confirmDelete") return <ConfirmModal payload={modal.payload} close={close} />;
   return null;
 }
@@ -3070,32 +3028,20 @@ function ConfirmModal({ payload, close }) {
 
 const canDeleteDirectly = (role) => role?.manageUsers === true;
 
-/** The actual, centralized cascade-delete logic for every deletable entity
- *  type, kept in one place so both an admin's immediate delete and an
- *  approved deletion request execute identically. */
-function executeDeletionRequest(d, { entityType, entityId }) {
-  if (entityType === "borrower") {
-    const loanIds = d.loans.filter((l) => l.borrowerId === entityId).map((l) => l.id);
-    d.payments = d.payments.filter((p) => !loanIds.includes(p.loanId));
-    d.collateral = d.collateral.filter((c) => !loanIds.includes(c.loanId));
-    d.loans = d.loans.filter((l) => l.borrowerId !== entityId);
-    d.borrowers = d.borrowers.filter((b) => b.id !== entityId);
-  } else if (entityType === "loan") {
-    d.payments = d.payments.filter((p) => p.loanId !== entityId);
-    d.collateral = d.collateral.filter((c) => c.loanId !== entityId);
-    d.loans = d.loans.filter((l) => l.id !== entityId);
-  } else if (entityType === "payment") {
-    d.payments = d.payments.filter((p) => p.id !== entityId);
-  } else if (entityType === "collateral") {
-    d.collateral = d.collateral.filter((c) => c.id !== entityId);
-  } else if (entityType === "expense") {
-    d.expenses = d.expenses.filter((e) => e.id !== entityId);
-  } else if (entityType === "fund") {
-    d.externalFunds = d.externalFunds.filter((f) => f.id !== entityId);
-  } else if (entityType === "fundRepayment") {
-    d.fundRepayments = d.fundRepayments.filter((r) => r.id !== entityId);
-  } else if (entityType === "user") {
-    d.users = d.users.filter((u) => u.id !== entityId);
+/** Calls the correct main-process delete mutation for an entity type. Kept
+ *  in one place so an admin's immediate delete and an approved request both
+ *  go through exactly the same code path. */
+function removeEntity(entityType, { actor, id, entityLabel }) {
+  switch (entityType) {
+    case "borrower": return api().borrowers.remove({ actor, id, entityLabel });
+    case "loan": return api().loans.remove({ actor, id, entityLabel });
+    case "payment": return api().payments.remove({ actor, id, entityLabel });
+    case "collateral": return api().collateral.remove({ actor, id, entityLabel });
+    case "expense": return api().expenses.remove({ actor, id, entityLabel });
+    case "fund": return api().funding.remove({ actor, id, entityLabel });
+    case "fundRepayment": return api().funding.repaymentDelete({ actor, id, entityLabel });
+    case "user": return api().users.remove({ actor, id, entityLabel });
+    default: return Promise.resolve({ ok: false, error: "Unknown record type." });
   }
 }
 
@@ -3104,16 +3050,22 @@ function executeDeletionRequest(d, { entityType, entityId }) {
  *  Everyone else instead sends a deletion request that sits in the
  *  Approvals page until an administrator approves or rejects it, nothing
  *  is actually removed until that happens. */
-function confirmOrRequestDelete({ role, currentUser, update, showToast, setModal, entityType, entityId, entityLabel, title, message, onDeleted }) {
+function confirmOrRequestDelete({ role, currentUser, update, showToast, setModal, actor, entityType, entityId, entityLabel, title, message, onDeleted }) {
   if (canDeleteDirectly(role)) {
     setModal({
       type: "confirmDelete",
       payload: {
         title, message,
-        onConfirm: () => {
-          update((d) => { executeDeletionRequest(d, { entityType, entityId }); }, `Deleted ${entityLabel}`);
-          showToast(`${entityLabel} deleted.`);
-          if (onDeleted) onDeleted();
+        onConfirm: async () => {
+          try {
+            const result = await removeEntity(entityType, { actor: actor || actorOf(currentUser), id: entityId, entityLabel });
+            if (!result?.ok) return showToast(result?.error || "Could not delete this record.");
+            showToast(`${entityLabel} deleted.`);
+            if (onDeleted) onDeleted();
+            update();
+          } catch (e) {
+            showToast(e.message || "Could not delete this record.");
+          }
         },
       },
     });
@@ -3124,40 +3076,51 @@ function confirmOrRequestDelete({ role, currentUser, update, showToast, setModal
         title: "Request deletion approval",
         message: `You don't have permission to delete this directly. ${message} This will send a request to an administrator, nothing is deleted until they approve it.`,
         confirmLabel: "Send request",
-        onConfirm: () => {
-          update((d) => {
-            d.deletionRequests.push({
-              id: uid("delreq"), entityType, entityId, entityLabel,
-              requestedBy: currentUser.username, requestedByName: currentUser.fullName,
-              status: "pending", createdAt: new Date().toISOString(),
+        onConfirm: async () => {
+          try {
+            const result = await api().approvals.request({
+              actor: actor || actorOf(currentUser),
+              requestedBy: currentUser.username,
+              requestedByName: currentUser.fullName,
+              entityType, entityId, entityLabel,
             });
-          }, `Requested deletion approval for ${entityLabel}`);
-          showToast("Deletion request sent to an administrator for approval.");
+            if (!result?.ok) return showToast(result?.error || "Could not send that request.");
+            showToast("Deletion request sent to an administrator for approval.");
+            update();
+          } catch (e) {
+            showToast(e.message || "Could not send that request.");
+          }
         },
       },
     });
   }
 }
 
-function ChangePasswordForm({ data, update, showToast, close, currentUser }) {
+function ChangePasswordForm({ showToast, close, currentUser }) {
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  const [saving, setSaving] = useState(false);
 
   const submit = async () => {
-    const user = data.users.find((u) => u.id === currentUser.id);
-    const ok = user ? await verifyPassword(currentPassword, user.passwordSalt, user.passwordHash) : false;
-    if (!ok) return showToast("Current password is incorrect.");
+    if (saving) return;
     if (!newPassword || newPassword.length < 4) return showToast("New password must be at least 4 characters.");
     if (newPassword !== confirmPassword) return showToast("New passwords don't match.");
-    const salt = randomSalt();
-    const hash = await hashPassword(newPassword, salt);
-    update((d) => {
-      const u = d.users.find((x) => x.id === currentUser.id);
-      u.passwordHash = hash; u.passwordSalt = salt; delete u.password;
-    }, "Changed own password");
-    showToast("Password updated.");
-    close();
+    setSaving(true);
+    try {
+      const result = await api().auth.changePassword({
+        userId: currentUser.id,
+        currentPassword,
+        newPassword,
+      });
+      if (!result?.ok) return showToast(result?.error || "Could not change your password.");
+      showToast("Password updated.");
+      close();
+    } catch (e) {
+      showToast(e.message || "Could not change your password.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -3179,34 +3142,37 @@ function ChangePasswordForm({ data, update, showToast, close, currentUser }) {
   );
 }
 
-function FundReceivedForm({ update, showToast, close, existing }) {
+function FundReceivedForm({ update, showToast, close, existing, actor }) {
   const [type, setType] = useState(existing?.type || "External Loan");
   const [source, setSource] = useState(existing?.source || "");
   const [amount, setAmount] = useState(existing ? String(existing.amount) : "");
   const [dateReceived, setDateReceived] = useState(existing?.dateReceived || todayISO());
   const [expectedRepaymentDate, setExpectedRepaymentDate] = useState(existing?.expectedRepaymentDate || "");
   const [notes, setNotes] = useState(existing?.notes || "");
+  const [saving, setSaving] = useState(false);
 
-  const submit = () => {
+  const submit = async () => {
+    if (saving) return;
     if (!source.trim()) return showToast(type === "Bank" ? "Enter the bank's name." : "Enter the lender's name.");
     if (!amount || Number(amount) <= 0) return showToast("Enter the amount received.");
-    if (existing) {
-      update((d) => {
-        Object.assign(d.externalFunds.find((f) => f.id === existing.id), {
-          type, source: source.trim(), amount: Number(amount), dateReceived, expectedRepaymentDate, notes,
-        });
-      }, `Edited funding record from ${source.trim()} (${type})`);
-      showToast("Updated.");
-    } else {
-      update((d) => {
-        d.externalFunds.push({
-          id: uid("fund"), type, source: source.trim(), amount: Number(amount), dateReceived,
-          expectedRepaymentDate, notes, voided: false,
-        });
-      }, `Recorded ${fmt(Number(amount))} received from ${source.trim()} (${type})`);
-      showToast("Recorded.");
+    setSaving(true);
+    try {
+      const data = {
+        type, source: source.trim(), amount: Number(amount), dateReceived,
+        expectedRepaymentDate, notes,
+      };
+      const result = existing
+        ? await api().funding.update({ actor, id: existing.id, data })
+        : await api().funding.create({ actor, data });
+      if (!result?.ok) return showToast(result?.error || "Could not save this funding record.");
+      showToast(existing ? "Updated." : "Recorded.");
+      close();
+      update();
+    } catch (e) {
+      showToast(e.message || "Could not save this funding record.");
+    } finally {
+      setSaving(false);
     }
-    close();
   };
 
   return (
@@ -3239,36 +3205,47 @@ function FundReceivedForm({ update, showToast, close, existing }) {
   );
 }
 
-function FundRepaymentForm({ data, update, showToast, close, payload, existing }) {
+function FundRepaymentForm({ update, showToast, close, payload, existing, actor, version }) {
   const [fundId, setFundId] = useState(existing?.fundId || payload?.fundId || "");
   const [fq, setFq] = useState("");
+  const search = useDebounced(fq, 250);
   const [amount, setAmount] = useState(existing ? String(existing.amount) : "");
   const [date, setDate] = useState(existing?.date || todayISO());
   const [method, setMethod] = useState(existing?.method || "Cash");
   const [notes, setNotes] = useState(existing?.notes || "");
+  const [saving, setSaving] = useState(false);
 
-  const openFunds = data.externalFunds.filter((f) => !f.voided && (fundStatus(f, data.fundRepayments) !== "Fully Paid" || f.id === existing?.fundId));
-  const matches = fq ? openFunds.filter((f) => (f.source + " " + f.type).toLowerCase().includes(fq.toLowerCase())) : openFunds;
-  const selectedFund = data.externalFunds.find((f) => f.id === fundId);
-  // When editing, exclude this repayment's own amount so "outstanding" reflects what it'd be after saving.
-  const otherRepayments = existing ? data.fundRepayments.filter((r) => r.id !== existing.id) : data.fundRepayments;
-  const outstanding = selectedFund ? Math.max(0, selectedFund.amount - fundRepaidAmount(selectedFund.id, otherRepayments)) : 0;
+  const openState = useServerData(
+    () => api().funding.open({ q: search, selectedFundId: fundId, excludeRepaymentId: existing?.id, limit: 40 }),
+    [search, fundId, existing?.id, version]
+  );
+  const contextState = useServerData(
+    () => (fundId ? api().funding.repaymentContext({ fundId, excludeRepaymentId: existing?.id }) : Promise.resolve(null)),
+    [fundId, existing?.id, version]
+  );
+  const openFunds = openState.data || [];
+  const selectedFund = contextState.data;
+  const outstanding = selectedFund?.outstanding || 0;
 
-  const submit = () => {
+  const submit = async () => {
+    if (saving) return;
     if (!fundId) return showToast("Select which loan or bank fund this repayment is for.");
     if (!amount || Number(amount) <= 0) return showToast("Enter the repayment amount.");
-    if (existing) {
-      update((d) => {
-        Object.assign(d.fundRepayments.find((r) => r.id === existing.id), { fundId, amount: Number(amount), date, method, notes });
-      }, `Edited repayment to ${selectedFund.source} (${selectedFund.type})`);
-      showToast("Repayment updated.");
-    } else {
-      update((d) => {
-        d.fundRepayments.push({ id: uid("fundpay"), fundId, amount: Number(amount), date, method, notes, voided: false });
-      }, `Recorded repayment of ${fmt(Number(amount))} to ${selectedFund.source} (${selectedFund.type})`);
-      showToast("Repayment recorded.");
+    setSaving(true);
+    try {
+      const data = { fundId, amount: Number(amount), date, method, notes };
+      const result = existing
+        ? await api().funding.repaymentUpdate({ actor, id: existing.id, data })
+        : await api().funding.repaymentCreate({ actor, data });
+      if (!result?.ok) return showToast(result?.error || "Could not save this repayment.");
+      showToast(existing ? "Repayment updated." : "Repayment recorded.");
+      close();
+      update();
+    } catch (e) {
+      showToast(e.message || "Could not save this repayment.");
+    } finally {
+      setSaving(false);
     }
-    close();
   };
 
   return (
@@ -3283,10 +3260,10 @@ function FundRepaymentForm({ data, update, showToast, close, payload, existing }
           <>
             <input style={FieldStyle.input} placeholder="Search lender or bank name…" value={fq} onChange={(e) => setFq(e.target.value)} />
             <div style={{ border: `1px solid ${C.border}`, borderRadius: 7, marginTop: 4, maxHeight: 160, overflowY: "auto" }}>
-              {matches.length === 0 && <div style={{ padding: 10, fontSize: 13, color: C.ink3 }}>No outstanding external funding matches.</div>}
-              {matches.map((f) => (
+              {openFunds.length === 0 && <div style={{ padding: 10, fontSize: 13, color: C.ink3 }}>No outstanding external funding matches.</div>}
+              {openFunds.map((f) => (
                 <div key={f.id} onClick={() => setFundId(f.id)} style={{ padding: "8px 11px", fontSize: 15, cursor: "pointer", borderBottom: `1px solid ${C.border}` }}>
-                  <b>{f.source}</b> · {f.type} <span style={{ color: C.ink4 }}>· {fmt(Math.max(0, f.amount - fundRepaidAmount(f.id, otherRepayments)))} left</span>
+                  <b>{f.source}</b> · {f.type} <span style={{ color: C.ink4 }}>· {fmt(f.outstanding || 0)} left</span>
                 </div>
               ))}
             </div>
@@ -3311,47 +3288,84 @@ function FundRepaymentForm({ data, update, showToast, close, payload, existing }
   );
 }
 
-function EditLoanForm({ data, update, showToast, close, payload }) {
-  const loan = data.loans.find((l) => l.id === payload?.loanId);
-  if (!loan) return null;
-  const borrower = data.borrowers.find((b) => b.id === loan.borrowerId);
+function EditLoanForm({ update, showToast, close, payload, actor, version }) {
+  const { loading, data, error } = useServerData(
+    () => (payload?.loanId ? api().loans.get({ id: payload.loanId, paymentLimit: 0 }) : Promise.resolve(null)),
+    [payload?.loanId, version]
+  );
+  const loan = data?.loan;
+  const borrower = data?.borrower;
 
-  const [amount, setAmount] = useState(String(loan.amount));
-  const [interestType, setInterestType] = useState(loan.interestType);
-  const [interestValue, setInterestValue] = useState(String(loan.interestValue));
-  const [hasPaperworkFee, setHasPaperworkFee] = useState((loan.paperworkFee || 0) > 0);
-  const [paperworkFee, setPaperworkFee] = useState(String(loan.paperworkFee || DEFAULT_PAPERWORK_FEE));
-  const [issueDate, setIssueDate] = useState(loan.issueDate);
-  const [dueDate, setDueDate] = useState(loan.dueDate);
-  const [repaymentMethod, setRepaymentMethod] = useState(loan.repaymentMethod);
-  const [instCount, setInstCount] = useState(loan.instalments ? String(loan.instalments.count) : "");
-  const [instFreq, setInstFreq] = useState(loan.instalments ? loan.instalments.frequency : "Monthly");
-  const [instAmount, setInstAmount] = useState(loan.instalments ? String(loan.instalments.expectedAmount) : "");
-  const [instFirst, setInstFirst] = useState(loan.instalments ? loan.instalments.firstPaymentDate : "");
+  const [amount, setAmount] = useState("");
+  const [interestType, setInterestType] = useState("Percent");
+  const [interestValue, setInterestValue] = useState("");
+  const [hasPaperworkFee, setHasPaperworkFee] = useState(false);
+  const [paperworkFee, setPaperworkFee] = useState(String(DEFAULT_PAPERWORK_FEE));
+  const [issueDate, setIssueDate] = useState("");
+  const [dueDate, setDueDate] = useState("");
+  const [repaymentMethod, setRepaymentMethod] = useState("Full Payment");
+  const [instCount, setInstCount] = useState("");
+  const [instFreq, setInstFreq] = useState("Monthly");
+  const [instAmount, setInstAmount] = useState("");
+  const [instFirst, setInstFirst] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!loan) return;
+    setAmount(String(loan.amount));
+    setInterestType(loan.interestType || "Percent");
+    setInterestValue(String(loan.interestValue || 0));
+    setHasPaperworkFee((loan.paperworkFee || 0) > 0);
+    setPaperworkFee(String(loan.paperworkFee || DEFAULT_PAPERWORK_FEE));
+    setIssueDate(loan.issueDate || todayISO());
+    setDueDate(loan.dueDate || todayISO());
+    setRepaymentMethod(loan.repaymentMethod || "Full Payment");
+    setInstCount(loan.instalments ? String(loan.instalments.count) : "");
+    setInstFreq(loan.instalments ? loan.instalments.frequency : "Monthly");
+    setInstAmount(loan.instalments ? String(loan.instalments.expectedAmount) : "");
+    setInstFirst(loan.instalments ? loan.instalments.firstPaymentDate : "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loan?.id]);
+
+  if (loading && !data) return <LoadingCard />;
+  if (error) return <ErrorCard error={error} />;
+  if (!loan) return null;
 
   const interestAmount = interestType === "Percent" ? (Number(amount) || 0) * (Number(interestValue) || 0) / 100 : (Number(interestValue) || 0);
   const feeAmount = hasPaperworkFee ? (Number(paperworkFee) || 0) : 0;
   const totalPayable = (Number(amount) || 0) + interestAmount + feeAmount;
-  const alreadyPaid = paidAmountFor(loan.id, data.payments);
+  const alreadyPaid = loan.paidAmount;
 
-  const submit = () => {
+  const submit = async () => {
+    if (saving) return;
     if (!amount || Number(amount) <= 0) return showToast("Enter a loan amount.");
     if (!dueDate) return showToast("Set the due date.");
     if (totalPayable < alreadyPaid) {
       return showToast(`The new total (${fmt(totalPayable)}) can't be less than what's already been paid (${fmt(alreadyPaid)}).`);
     }
-    update((d) => {
-      const l = d.loans.find((x) => x.id === loan.id);
-      Object.assign(l, {
-        amount: Number(amount), interestType, interestValue: Number(interestValue) || 0,
-        paperworkFee: feeAmount, totalPayable, issueDate, dueDate, repaymentMethod,
-        instalments: repaymentMethod === "Instalments" ? {
-          count: Number(instCount) || 0, frequency: instFreq, expectedAmount: Number(instAmount) || 0, firstPaymentDate: instFirst
-        } : null,
+    setSaving(true);
+    try {
+      const result = await api().loans.update({
+        actor,
+        id: loan.id,
+        data: {
+          amount: Number(amount), interestType, interestValue: Number(interestValue) || 0,
+          paperworkFee: feeAmount, issueDate, dueDate, repaymentMethod,
+          instalments: repaymentMethod === "Instalments" ? {
+            count: Number(instCount) || 0, frequency: instFreq,
+            expectedAmount: Number(instAmount) || 0, firstPaymentDate: instFirst,
+          } : null,
+        },
       });
-    }, `Edited loan ${loan.loanNumber}`);
-    showToast("Loan updated.");
-    close();
+      if (!result?.ok) return showToast(result?.error || "Could not update this loan.");
+      showToast("Loan updated.");
+      close();
+      update();
+    } catch (e) {
+      showToast(e.message || "Could not update this loan.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -3424,49 +3438,76 @@ function EditLoanForm({ data, update, showToast, close, payload }) {
   );
 }
 
-function RenewLoanForm({ data, update, showToast, close, payload, goLoan }) {
-  const old = data.loans.find((l) => l.id === payload?.loanId);
-  if (!old) return null;
-  const borrower = data.borrowers.find((b) => b.id === old.borrowerId);
-  const outstanding = Math.max(0, old.totalPayable - paidAmountFor(old.id, data.payments));
-  const defaultTerm = Math.max(daysBetween(old.issueDate, old.dueDate), 7);
-  const defaultDue = (() => {
-    const d = new Date();
-    d.setDate(d.getDate() + defaultTerm);
-    return d.toISOString().slice(0, 10);
-  })();
+function RenewLoanForm({ update, showToast, close, payload, goLoan, actor, version }) {
+  const { loading, data, error } = useServerData(
+    () => (payload?.loanId ? api().loans.get({ id: payload.loanId, paymentLimit: 0 }) : Promise.resolve(null)),
+    [payload?.loanId, version]
+  );
+  const loan = data?.loan;
+  const borrower = data?.borrower;
+  const outstanding = loan ? Math.max(0, loan.totalPayable - loan.paidAmount) : 0;
 
-  const [principal, setPrincipal] = useState(String(outstanding));
+  const [principal, setPrincipal] = useState("");
   const [interestType, setInterestType] = useState("Percent");
   const [interestValue, setInterestValue] = useState(String(DEFAULT_INTEREST_RATE));
-  const [newDueDate, setNewDueDate] = useState(defaultDue);
+  const [newDueDate, setNewDueDate] = useState("");
   const [hasFee, setHasFee] = useState(false);
   const [fee, setFee] = useState(String(DEFAULT_PAPERWORK_FEE));
+  const [saving, setSaving] = useState(false);
+  const [initialized, setInitialized] = useState(false);
+
+  useEffect(() => {
+    if (!loan || initialized) return;
+    const term = Math.max(daysBetween(loan.issueDate, loan.dueDate), 7);
+    const d = new Date();
+    d.setDate(d.getDate() + term);
+    setPrincipal(String(Math.max(0, loan.totalPayable - loan.paidAmount)));
+    setNewDueDate(d.toISOString().slice(0, 10));
+    setInitialized(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loan?.id]);
 
   const interestAmt = interestType === "Percent" ? (Number(principal) || 0) * (Number(interestValue) || 0) / 100 : (Number(interestValue) || 0);
   const feeAmt = hasFee ? (Number(fee) || 0) : 0;
   const totalPayable = (Number(principal) || 0) + interestAmt + feeAmt;
 
-  const submit = () => {
+  if (loading && !data) return <LoadingCard />;
+  if (error) return <ErrorCard error={error} />;
+  if (!loan) return null;
+
+  const submit = async () => {
+    if (saving) return;
     if (!newDueDate) return showToast("Set the new due date for this loan.");
     if (!principal || Number(principal) <= 0) return showToast("Enter the amount being carried into the renewed loan.");
-    let newId = null;
-    update((d) => {
-      newId = renewLoan(d, old.id, {
-        newPrincipal: Number(principal), interestType, interestValue: Number(interestValue) || 0,
-        newDueDate, paperworkFee: feeAmt,
+    setSaving(true);
+    try {
+      const result = await api().loans.renew({
+        actor,
+        id: loan.id,
+        opts: {
+          newPrincipal: Number(principal),
+          interestType,
+          interestValue: Number(interestValue) || 0,
+          newDueDate,
+          paperworkFee: feeAmt,
+        },
       });
-    }, `Renewed loan ${old.loanNumber}`);
-    if (!newId) return showToast("This loan can't be renewed.");
-    showToast("Loan renewed.");
-    close();
-    goLoan(newId);
+      if (!result?.ok) return showToast(result?.error || "This loan can't be renewed.");
+      showToast("Loan renewed.");
+      update();
+      close();
+      goLoan(result.id);
+    } catch (e) {
+      showToast(e.message || "This loan can't be renewed.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
     <ModalShell title="Renew loan" onClose={close} wide>
       <div style={{ background: C.forestSoft, border: "1px solid #B9CDAE", borderRadius: 9, padding: 12, marginBottom: 14, fontSize: 14.5 }}>
-        Renewing <b>{old.loanNumber}</b> for <b>{borrower?.fullName}</b>. The outstanding balance of <b>{fmt(outstanding)}</b> will roll into a brand new loan, and {old.loanNumber} will be marked Renewed and kept in the borrower's history.
+        Renewing <b>{loan.loanNumber}</b> for <b>{borrower?.fullName}</b>. The outstanding balance of <b>{fmt(outstanding)}</b> will roll into a brand new loan, and {loan.loanNumber} will be marked Renewed and kept in the borrower's history.
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", columnGap: 14 }}>
         <Field label="Amount carried into new loan" required hint="Defaults to the outstanding balance">
@@ -3508,48 +3549,53 @@ function RenewLoanForm({ data, update, showToast, close, payload, goLoan }) {
 
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
         <button style={Btn.secondary} onClick={close}>Cancel</button>
-        <button style={Btn.primary} onClick={submit}>Renew loan</button>
+        <button style={Btn.primary} disabled={saving} onClick={submit}>{saving ? "Renewing…" : "Renew loan"}</button>
       </div>
     </ModalShell>
   );
 }
 
-function BorrowerForm({ data, update, showToast, close, existing, goBorrower }) {
-  const [f, setF] = useState(existing || {
+function BorrowerForm({ update, showToast, close, existing, goBorrower, actor }) {
+  const [f, setF] = useState(existing ? {
+    fullName: existing.fullName || "", phone: existing.phone || "", altPhone: existing.altPhone || "",
+    nationalId: existing.nationalId || "", address: existing.address || "", occupation: existing.occupation || "",
+    nextOfKin: existing.nextOfKin || "", nextOfKinPhone: existing.nextOfKinPhone || "", notes: existing.notes || "",
+  } : {
     fullName: "", phone: "", altPhone: "", nationalId: "", address: "", occupation: "",
     nextOfKin: "", nextOfKinPhone: "", notes: "",
   });
   const [duplicateMatch, setDuplicateMatch] = useState(null);
+  const [saving, setSaving] = useState(false);
   const set = (k) => (e) => { setF({ ...f, [k]: e.target.value }); setDuplicateMatch(null); };
   const setPhone = (k) => (e) => { setF({ ...f, [k]: digitsOnly(e.target.value) }); setDuplicateMatch(null); };
   const setNin = (e) => setF({ ...f, nationalId: ninChars(e.target.value) });
 
-  const findDuplicate = () => {
-    const name = f.fullName.trim().toLowerCase();
-    const phone = f.phone.trim();
-    if (!name || !phone) return null;
-    return data.borrowers.find((b) =>
-      b.id !== existing?.id &&
-      b.fullName.trim().toLowerCase() === name &&
-      b.phone.trim() === phone
-    );
-  };
-
-  const doSave = () => {
-    if (existing) {
-      update((d) => { Object.assign(d.borrowers.find((b) => b.id === existing.id), f); }, `Edited borrower profile "${f.fullName.trim()}"`);
-      showToast("Borrower profile updated.");
+  const doSave = async () => {
+    if (saving) return;
+    setSaving(true);
+    try {
+      const data = {
+        fullName: f.fullName.trim(), phone: f.phone.trim(), altPhone: f.altPhone,
+        nationalId: f.nationalId, address: f.address, occupation: f.occupation,
+        nextOfKin: f.nextOfKin, nextOfKinPhone: f.nextOfKinPhone, notes: f.notes,
+      };
+      const result = existing
+        ? await api().borrowers.update({ actor, id: existing.id, data })
+        : await api().borrowers.create({ actor, data: { ...data, dateRegistered: todayISO() } });
+      if (!result?.ok) return showToast(result?.error || "Could not save this borrower.");
+      showToast(existing ? "Borrower profile updated." : "Borrower registered.");
       close();
-    } else {
-      const id = uid("bor");
-      update((d) => { d.borrowers.push({ ...f, id, dateRegistered: todayISO() }); }, `Registered new borrower "${f.fullName.trim()}"`);
-      showToast("Borrower registered.");
-      close();
-      goBorrower(id);
+      update();
+      if (!existing && result.borrower) goBorrower(result.borrower.id);
+    } catch (e) {
+      showToast(e.message || "Could not save this borrower.");
+    } finally {
+      setSaving(false);
     }
   };
 
-  const submit = () => {
+  const submit = async () => {
+    if (saving) return;
     if (!f.fullName.trim()) return showToast("Full name is required.");
     if (!f.phone.trim()) return showToast("Phone number is required.");
     if (!isValidPhone(f.phone)) return showToast("Phone number must be exactly 10 digits, starting with 07, 03, or 04.");
@@ -3557,8 +3603,16 @@ function BorrowerForm({ data, update, showToast, close, existing, goBorrower }) 
     if (f.nextOfKinPhone && !isValidPhone(f.nextOfKinPhone)) return showToast("Next of kin phone number must be exactly 10 digits, starting with 07, 03, or 04.");
     if (f.nationalId && !isValidNin(f.nationalId)) return showToast("National ID number must be exactly 14 characters.");
 
-    const dup = findDuplicate();
-    if (dup) { setDuplicateMatch(dup); return; }
+    try {
+      const dup = await api().borrowers.duplicate({
+        name: f.fullName.trim(),
+        phone: f.phone.trim(),
+        excludeId: existing?.id,
+      });
+      if (dup) { setDuplicateMatch(dup); return; }
+    } catch (e) {
+      return showToast(e.message || "Could not check for a duplicate borrower.");
+    }
     doSave();
   };
 
@@ -3607,15 +3661,30 @@ function BorrowerForm({ data, update, showToast, close, existing, goBorrower }) 
 
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
         <button style={Btn.secondary} onClick={close}>Cancel</button>
-        <button style={Btn.primary} onClick={submit}>{existing ? "Save changes" : "Register borrower"}</button>
+        <button style={Btn.primary} disabled={saving} onClick={submit}>{saving ? "Saving…" : existing ? "Save changes" : "Register borrower"}</button>
       </div>
     </ModalShell>
   );
 }
 
-function LoanForm({ data, update, showToast, close, payload, goLoan, setModal }) {
+function LoanForm({ update, showToast, close, payload, goLoan, setModal, actor, version }) {
   const [borrowerId, setBorrowerId] = useState(payload?.borrowerId || "");
   const [bq, setBq] = useState("");
+  const [selectedBorrower, setSelectedBorrower] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const search = useDebounced(bq, 250);
+  const pickerState = useServerData(
+    () => (search.trim() ? api().borrowers.pick({ q: search, limit: 20 }) : Promise.resolve([])),
+    [search, version]
+  );
+  const prefillState = useServerData(
+    () => (payload?.borrowerId ? api().borrowers.get({ id: payload.borrowerId, loanLimit: 1 }) : Promise.resolve(null)),
+    [payload?.borrowerId, version]
+  );
+  useEffect(() => {
+    if (payload?.borrowerId && prefillState.data?.borrower) setSelectedBorrower(prefillState.data.borrower);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [payload?.borrowerId, prefillState.data?.borrower?.id]);
   const [amount, setAmount] = useState("");
   const [interestType, setInterestType] = useState("Percent");
   const [interestValue, setInterestValue] = useState(String(DEFAULT_INTEREST_RATE));
@@ -3665,10 +3734,10 @@ function LoanForm({ data, update, showToast, close, payload, goLoan, setModal })
     return amt + interestAmount + feeAmount;
   }, [amount, interestAmount, feeAmount]);
 
-  const matches = bq ? data.borrowers.filter((b) => b.fullName.toLowerCase().includes(bq.toLowerCase())) : [];
-  const selectedBorrower = data.borrowers.find((b) => b.id === borrowerId);
+  const matches = pickerState.data || [];
 
-  const submit = () => {
+  const submit = async () => {
+    if (saving) return;
     if (!borrowerId) return showToast("Please select a borrower first.");
     if (!amount || Number(amount) <= 0) return showToast("Enter a loan amount.");
     if (!dueDate) return showToast("Please set the date this loan is expected to be paid.");
@@ -3676,37 +3745,42 @@ function LoanForm({ data, update, showToast, close, payload, goLoan, setModal })
     if (hasCollateral && !col.description.trim()) return showToast("Describe the security/collateral, or turn that section off.");
     if (isHistorical && priorPaid && Number(priorPaid) > totalPayable) return showToast("Amount already paid can't be more than the total amount payable.");
 
-    const count = (data.loans.filter(l=>l.loanNumber?.startsWith(`LN-${new Date().getFullYear()}`)).length) + 1;
-    const loanNumber = `LN-${new Date().getFullYear()}-${String(count).padStart(4, "0")}`;
-    const id = uid("loan");
-    update((d) => {
-      d.loans.push({
-        id, loanNumber, borrowerId, amount: Number(amount), interestType, interestValue: Number(interestValue) || 0,
-        paperworkFee: feeAmount,
-        totalPayable, issueDate, dueDate, repaymentMethod,
-        issuedAt: new Date().toISOString(),
-        instalments: repaymentMethod === "Instalments" ? {
-          count: Number(instCount), frequency: instFreq, expectedAmount: Number(instAmount), firstPaymentDate: instFirst
-        } : null,
-        voided: false,
-        isHistorical,
+    setSaving(true);
+    try {
+      const result = await api().loans.create({
+        actor,
+        data: {
+          borrowerId,
+          amount: Number(amount),
+          interestType,
+          interestValue: Number(interestValue) || 0,
+          paperworkFee: feeAmount,
+          issueDate,
+          dueDate,
+          repaymentMethod,
+          instalments: repaymentMethod === "Instalments" ? {
+            count: Number(instCount), frequency: instFreq,
+            expectedAmount: Number(instAmount), firstPaymentDate: instFirst,
+          } : null,
+          isHistorical,
+          collateral: hasCollateral && col.description.trim()
+            ? { ...col, estimatedValue: Number(col.estimatedValue) || 0 }
+            : null,
+          priorPaid: isHistorical ? Number(priorPaid) || 0 : 0,
+          priorPaidDate,
+          priorPaidMethod,
+        },
       });
-      if (hasCollateral && col.description.trim()) {
-        d.collateral.push({
-          id: uid("col"), loanId: id, borrowerId, ...col,
-          estimatedValue: Number(col.estimatedValue) || 0, dateReceived: issueDate, status: "Held", photos: [],
-        });
-      }
-      if (isHistorical && priorPaid && Number(priorPaid) > 0) {
-        d.payments.push({
-          id: uid("pay"), loanId: id, borrowerId, amount: Number(priorPaid), date: priorPaidDate,
-          method: priorPaidMethod, reference: "", notes: "Entered while recording previous loan history.", voided: false,
-        });
-      }
-    }, `Issued loan ${loanNumber} for ${fmt(Number(amount))}${isHistorical ? " (migrated record)" : ""}`);
-    showToast(hasCollateral ? "Loan issued with security recorded." : "Loan issued.");
-    close();
-    goLoan(id);
+      if (!result?.ok) return showToast(result?.error || "Could not issue this loan.");
+      showToast(hasCollateral ? "Loan issued with security recorded." : "Loan issued.");
+      close();
+      update();
+      goLoan(result.id);
+    } catch (e) {
+      showToast(e.message || "Could not issue this loan.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -3724,10 +3798,10 @@ function LoanForm({ data, update, showToast, close, payload, goLoan, setModal })
       </div>
 
       <Field label="Borrower" required>
-        {selectedBorrower ? (
+        {borrowerId ? (
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 11px", border: `1px solid ${C.border}`, borderRadius: 7, background: C.forestSoft }}>
-            <span style={{ fontWeight: 600, fontSize: 16 }}>{selectedBorrower.fullName}</span>
-            <span style={{ color: C.forest, fontSize: 14.5, cursor: "pointer", fontWeight: 600 }} onClick={() => setBorrowerId("")}>Change</span>
+            <span style={{ fontWeight: 600, fontSize: 16 }}>{selectedBorrower ? selectedBorrower.fullName : "Loading borrower…"}</span>
+            <span style={{ color: C.forest, fontSize: 14.5, cursor: "pointer", fontWeight: 600 }} onClick={() => { setBorrowerId(""); setSelectedBorrower(null); setBq(""); }}>Change</span>
           </div>
         ) : (
           <>
@@ -3735,7 +3809,7 @@ function LoanForm({ data, update, showToast, close, payload, goLoan, setModal })
             {matches.length > 0 && (
               <div style={{ border: `1px solid ${C.border}`, borderRadius: 7, marginTop: 4, maxHeight: 140, overflowY: "auto" }}>
                 {matches.map((b) => (
-                  <div key={b.id} onClick={() => { setBorrowerId(b.id); setBq(""); }} style={{ padding: "8px 11px", fontSize: 15.5, cursor: "pointer", borderBottom: `1px solid ${C.border}` }}>{b.fullName} <span style={{ color: C.ink4 }}>· {b.phone}</span></div>
+                  <div key={b.id} onClick={() => { setBorrowerId(b.id); setSelectedBorrower(b); setBq(""); }} style={{ padding: "8px 11px", fontSize: 15.5, cursor: "pointer", borderBottom: `1px solid ${C.border}` }}>{b.fullName} <span style={{ color: C.ink4 }}>· {b.phone}</span></div>
                 ))}
               </div>
             )}
@@ -3876,13 +3950,13 @@ function LoanForm({ data, update, showToast, close, payload, goLoan, setModal })
 
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 }}>
         <button style={Btn.secondary} onClick={close}>Cancel</button>
-        <button style={Btn.primary} onClick={submit}>Issue loan</button>
+        <button style={Btn.primary} disabled={saving} onClick={submit}>{saving ? "Issuing…" : "Issue loan"}</button>
       </div>
     </ModalShell>
   );
 }
 
-function PaymentForm({ data, update, showToast, close, payload, existing }) {
+function PaymentForm({ update, showToast, close, payload, existing, actor, version }) {
   const [loanId, setLoanId] = useState(existing?.loanId || payload?.loanId || "");
   const [lq, setLq] = useState("");
   const [principalAmt, setPrincipalAmt] = useState(existing ? String(existing.principalPaid || 0) : "");
@@ -3891,59 +3965,71 @@ function PaymentForm({ data, update, showToast, close, payload, existing }) {
   const [method, setMethod] = useState(existing?.method || "Cash");
   const [reference, setReference] = useState(existing?.reference || "");
   const [notes, setNotes] = useState(existing?.notes || "");
+  const [saving, setSaving] = useState(false);
 
-  const openLoans = data.loans.filter((l) => !l.voided && !l.renewed && loanStatus(l, data.payments) !== "Fully Paid");
-  const matches = lq ? openLoans.filter((l) => (l.loanNumber + " " + borrowerName(data.borrowers, l.borrowerId)).toLowerCase().includes(lq.toLowerCase())) : openLoans;
-  const selectedLoan = data.loans.find((l) => l.id === loanId);
-  // When editing, exclude this payment's own amount from "already paid" so the
-  // remaining figures reflect what they'd be once this edit is saved.
-  const otherPayments = existing ? data.payments.filter((p) => p.id !== existing.id) : data.payments;
-  const outstanding = selectedLoan ? Math.max(0, selectedLoan.totalPayable - paidAmountFor(selectedLoan.id, otherPayments)) : 0;
-  const remainingPrincipal = selectedLoan ? Math.max(0, selectedLoan.amount - principalPaidFor(selectedLoan.id, otherPayments)) : 0;
-  const remainingInterest = selectedLoan ? Math.max(0, loanInterestAmount(selectedLoan) - interestPaidFor(selectedLoan.id, otherPayments)) : 0;
+  const search = useDebounced(lq, 250);
+  const pickerState = useServerData(
+    () => api().loans.picker({ q: search, mode: "active", limit: 50 }),
+    [search, version]
+  );
+  const contextState = useServerData(
+    () => (loanId ? api().loans.paymentContext({ id: loanId, excludePaymentId: existing?.id }) : Promise.resolve(null)),
+    [loanId, existing?.id, version]
+  );
+  const openLoans = pickerState.data || [];
+  const context = contextState.data;
+  const selectedLoan = context?.loan;
+  const outstanding = context?.outstanding || 0;
+  const remainingPrincipal = context?.remainingPrincipal || 0;
+  const remainingInterest = context?.remainingInterest || 0;
   const totalAmount = (Number(principalAmt) || 0) + (Number(interestAmt) || 0);
 
-  const submit = () => {
+  const submit = async () => {
+    if (saving) return;
     if (!loanId) return showToast("Select a loan to record a payment against.");
     if (totalAmount <= 0) return showToast("Enter an amount towards principal, interest, or both.");
-    if (existing) {
-      update((d) => {
-        Object.assign(d.payments.find((p) => p.id === existing.id), {
-          amount: totalAmount, principalPaid: Number(principalAmt) || 0, interestPaid: Number(interestAmt) || 0,
-          date, method, reference, notes,
-        });
-      }, `Edited payment of ${fmt(totalAmount)} on loan ${selectedLoan.loanNumber}`);
-      showToast("Payment updated.");
-    } else {
-      const willBeFullyPaid = (paidAmountFor(selectedLoan.id, data.payments) + totalAmount) >= (selectedLoan.totalPayable - 0.5);
-      update((d) => {
-        d.payments.push({
-          id: uid("pay"), loanId, borrowerId: selectedLoan.borrowerId, amount: totalAmount,
-          principalPaid: Number(principalAmt) || 0, interestPaid: Number(interestAmt) || 0,
-          date, method, reference, notes, voided: false
-        });
-      }, `Recorded payment of ${fmt(totalAmount)} on loan ${selectedLoan.loanNumber}`);
-      showToast(willBeFullyPaid ? "Payment recorded. This loan is now fully paid." : "Payment recorded.");
+    setSaving(true);
+    try {
+      const data = {
+        principalPaid: Number(principalAmt) || 0,
+        interestPaid: Number(interestAmt) || 0,
+        amount: totalAmount,
+        date, method, reference, notes,
+      };
+      const result = existing
+        ? await api().payments.update({ actor, id: existing.id, data })
+        : await api().payments.create({ actor, data: { ...data, loanId } });
+      if (!result?.ok) return showToast(result?.error || "Could not save this payment.");
+      showToast(existing ? "Payment updated." : result.fullyPaid ? "Payment recorded. This loan is now fully paid." : "Payment recorded.");
+      close();
+      update();
+    } catch (e) {
+      showToast(e.message || "Could not save this payment.");
+    } finally {
+      setSaving(false);
     }
-    close();
   };
 
   return (
     <ModalShell title={existing ? "Edit payment" : "Record a payment"} onClose={close}>
       <Field label="Loan" required>
-        {selectedLoan ? (
+        {loanId ? (
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 11px", border: `1px solid ${C.border}`, borderRadius: 7, background: C.forestSoft }}>
-            <span style={{ fontSize: 15.5 }}><b>{selectedLoan.loanNumber}</b> · {borrowerName(data.borrowers, selectedLoan.borrowerId)}<br /><span style={{ fontSize: 14, color: C.ink3, ...numFont }}>{fmt(outstanding)} outstanding</span></span>
+            <span style={{ fontSize: 15.5 }}>
+              {selectedLoan ? (
+                <><b>{selectedLoan.loanNumber}</b> · {context?.borrower?.fullName || "Unknown borrower"}<br /><span style={{ fontSize: 14, color: C.ink3, ...numFont }}>{fmt(outstanding)} outstanding</span></>
+              ) : "Loading loan…"}
+            </span>
             {!existing && <span style={{ color: C.forest, fontSize: 14.5, cursor: "pointer", fontWeight: 600 }} onClick={() => setLoanId("")}>Change</span>}
           </div>
         ) : (
           <>
             <input style={FieldStyle.input} placeholder="Search borrower name or loan number…" value={lq} onChange={(e) => setLq(e.target.value)} />
             <div style={{ border: `1px solid ${C.border}`, borderRadius: 7, marginTop: 4, maxHeight: 160, overflowY: "auto" }}>
-              {matches.length === 0 && <div style={{ padding: 10, fontSize: 15, color: C.ink3 }}>No open loans match.</div>}
-              {matches.map((l) => (
+              {openLoans.length === 0 && <div style={{ padding: 10, fontSize: 15, color: C.ink3 }}>No open loans match.</div>}
+              {openLoans.map((l) => (
                 <div key={l.id} onClick={() => setLoanId(l.id)} style={{ padding: "8px 11px", fontSize: 15.5, cursor: "pointer", borderBottom: `1px solid ${C.border}` }}>
-                  <b>{l.loanNumber}</b> · {borrowerName(data.borrowers, l.borrowerId)} <span style={{ color: C.ink4 }}>· {fmt(Math.max(0, l.totalPayable - paidAmountFor(l.id, data.payments)))} left</span>
+                  <b>{l.loanNumber}</b> · {l.borrowerName || "Unknown borrower"} <span style={{ color: C.ink4 }}>· {fmt(l.outstanding || 0)} left</span>
                 </div>
               ))}
             </div>
@@ -3951,7 +4037,7 @@ function PaymentForm({ data, update, showToast, close, payload, existing }) {
         )}
       </Field>
 
-      {selectedLoan && (
+      {context && (
         <div style={{ display: "flex", gap: 20, background: C.bg, borderRadius: 8, padding: "10px 14px", marginBottom: 14 }}>
           <div>
             <div style={{ fontSize: 12.5, color: C.ink3, fontWeight: 600 }}>Principal remaining</div>
@@ -3985,13 +4071,13 @@ function PaymentForm({ data, update, showToast, close, payload, existing }) {
       <Field label="Notes"><textarea style={{ ...FieldStyle.input, minHeight: 50 }} value={notes} onChange={(e) => setNotes(e.target.value)} /></Field>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
         <button style={Btn.secondary} onClick={close}>Cancel</button>
-        <button style={Btn.primary} onClick={submit}>{existing ? "Save changes" : "Record payment"}</button>
+        <button style={Btn.primary} disabled={saving} onClick={submit}>{saving ? "Saving…" : existing ? "Save changes" : "Record payment"}</button>
       </div>
     </ModalShell>
   );
 }
 
-function CollateralForm({ data, update, showToast, close, payload, existing, t }) {
+function CollateralForm({ update, showToast, close, payload, existing, t, actor, version }) {
   const [loanId, setLoanId] = useState(existing?.loanId || payload?.loanId || "");
   const [lq, setLq] = useState("");
   const [f, setF] = useState(existing
@@ -4004,47 +4090,72 @@ function CollateralForm({ data, update, showToast, close, payload, existing, t }
         description: "", category: CATEGORY_OPTIONS[0], brand: "", model: "", serial: "",
         estimatedValue: "", condition: "", dateReceived: todayISO(), storageLocation: "", notes: "",
       });
+  const [saving, setSaving] = useState(false);
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
 
-  const loans = data.loans.filter((l) => !l.voided && !l.renewed);
-  const matches = lq ? loans.filter((l) => (l.loanNumber + " " + borrowerName(data.borrowers, l.borrowerId)).toLowerCase().includes(lq.toLowerCase())) : loans;
-  const selectedLoan = data.loans.find((l) => l.id === loanId);
+  const search = useDebounced(lq, 250);
+  const pickerState = useServerData(
+    () => api().loans.picker({ q: search, mode: "active", limit: 50 }),
+    [search, version]
+  );
+  const contextState = useServerData(
+    () => (loanId ? api().loans.get({ id: loanId, paymentLimit: 0 }) : Promise.resolve(null)),
+    [loanId, version]
+  );
+  const openLoans = pickerState.data || [];
+  const selectedLoan = contextState.data?.loan;
+  const selectedBorrower = contextState.data?.borrower;
 
-  const submit = () => {
+  const submit = async () => {
+    if (saving) return;
     if (!loanId) return showToast("Select the loan this collateral belongs to.");
     if (!f.description.trim()) return showToast("Describe the item.");
-    if (existing) {
-      update((d) => {
-        Object.assign(d.collateral.find((c) => c.id === existing.id), { ...f, loanId, borrowerId: selectedLoan.borrowerId, estimatedValue: Number(f.estimatedValue) || 0 });
-      }, `Edited collateral "${f.description.trim()}"`);
-      showToast("Collateral updated.");
-    } else {
-      update((d) => {
-        d.collateral.push({
-          id: uid("col"), loanId, borrowerId: selectedLoan.borrowerId, ...f,
-          estimatedValue: Number(f.estimatedValue) || 0, status: "Held", photos: [],
-        });
-      }, `Added collateral "${f.description.trim()}" on loan ${selectedLoan.loanNumber}`);
-      showToast("Collateral recorded.");
+    setSaving(true);
+    try {
+      const data = {
+        loanId,
+        description: f.description.trim(),
+        category: f.category,
+        brand: f.brand,
+        model: f.model,
+        serial: f.serial,
+        estimatedValue: Number(f.estimatedValue) || 0,
+        condition: f.condition,
+        dateReceived: f.dateReceived,
+        storageLocation: f.storageLocation,
+        notes: f.notes,
+      };
+      const result = existing
+        ? await api().collateral.update({ actor, id: existing.id, data })
+        : await api().collateral.create({ actor, data });
+      if (!result?.ok) return showToast(result?.error || "Could not save this collateral.");
+      showToast(existing ? "Collateral updated." : "Collateral recorded.");
+      close();
+      update();
+    } catch (e) {
+      showToast(e.message || "Could not save this collateral.");
+    } finally {
+      setSaving(false);
     }
-    close();
   };
 
   return (
     <ModalShell title={existing ? "Edit security / collateral" : "Add security / collateral"} onClose={close} wide>
       <Field label="Loan" required>
-        {selectedLoan ? (
+        {loanId ? (
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 11px", border: `1px solid ${C.border}`, borderRadius: 7, background: C.forestSoft }}>
-            <span style={{ fontSize: 15.5 }}><b>{selectedLoan.loanNumber}</b> · {borrowerName(data.borrowers, selectedLoan.borrowerId)}</span>
+            <span style={{ fontSize: 15.5 }}>
+              {selectedLoan ? <><b>{selectedLoan.loanNumber}</b> · {selectedBorrower?.fullName || "Unknown borrower"}</> : "Loading loan…"}
+            </span>
             <span style={{ color: C.forest, fontSize: 14.5, cursor: "pointer", fontWeight: 600 }} onClick={() => setLoanId("")}>Change</span>
           </div>
         ) : (
           <>
             <input style={FieldStyle.input} placeholder="Search borrower name or loan number…" value={lq} onChange={(e) => setLq(e.target.value)} />
             <div style={{ border: `1px solid ${C.border}`, borderRadius: 7, marginTop: 4, maxHeight: 140, overflowY: "auto" }}>
-              {matches.map((l) => (
+              {openLoans.map((l) => (
                 <div key={l.id} onClick={() => setLoanId(l.id)} style={{ padding: "8px 11px", fontSize: 15.5, cursor: "pointer", borderBottom: `1px solid ${C.border}` }}>
-                  <b>{l.loanNumber}</b> · {borrowerName(data.borrowers, l.borrowerId)}
+                  <b>{l.loanNumber}</b> · {l.borrowerName || "Unknown borrower"}
                 </div>
               ))}
             </div>
@@ -4072,28 +4183,40 @@ function CollateralForm({ data, update, showToast, close, payload, existing, t }
       </div>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
         <button style={Btn.secondary} onClick={close}>Cancel</button>
-        <button style={Btn.primary} onClick={submit}>{existing ? "Save changes" : "Save collateral"}</button>
+        <button style={Btn.primary} disabled={saving} onClick={submit}>{saving ? "Saving…" : existing ? "Save changes" : "Save collateral"}</button>
       </div>
     </ModalShell>
   );
 }
 
-function ExpenseForm({ update, showToast, close, existing }) {
+function ExpenseForm({ update, showToast, close, existing, actor }) {
   const [f, setF] = useState(existing
     ? { description: existing.description, category: existing.category, amount: String(existing.amount), date: existing.date, method: existing.method, notes: existing.notes || "" }
     : { description: "", category: EXPENSE_CATEGORIES[0], amount: "", date: todayISO(), method: "Cash", notes: "" });
+  const [saving, setSaving] = useState(false);
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
-  const submit = () => {
+  const submit = async () => {
+    if (saving) return;
     if (!f.description.trim()) return showToast("Describe the expense.");
     if (!f.amount || Number(f.amount) <= 0) return showToast("Enter an amount.");
-    if (existing) {
-      update((d) => { Object.assign(d.expenses.find((e) => e.id === existing.id), { ...f, amount: Number(f.amount) }); }, `Edited expense "${f.description.trim()}"`);
-      showToast("Expense updated.");
-    } else {
-      update((d) => { d.expenses.push({ id: uid("exp"), ...f, amount: Number(f.amount), voided: false }); }, `Recorded expense "${f.description.trim()}" (${fmt(Number(f.amount))})`);
-      showToast("Expense recorded.");
+    setSaving(true);
+    try {
+      const data = {
+        description: f.description.trim(), category: f.category,
+        amount: Number(f.amount), date: f.date, method: f.method, notes: f.notes,
+      };
+      const result = existing
+        ? await api().expenses.update({ actor, id: existing.id, data })
+        : await api().expenses.create({ actor, data });
+      if (!result?.ok) return showToast(result?.error || "Could not save this expense.");
+      showToast(existing ? "Expense updated." : "Expense recorded.");
+      close();
+      update();
+    } catch (e) {
+      showToast(e.message || "Could not save this expense.");
+    } finally {
+      setSaving(false);
     }
-    close();
   };
   return (
     <ModalShell title={existing ? "Edit expense" : "Record an operational expense"} onClose={close}>
@@ -4115,7 +4238,7 @@ function ExpenseForm({ update, showToast, close, existing }) {
       <Field label="Notes"><textarea style={{ ...FieldStyle.input, minHeight: 50 }} value={f.notes} onChange={set("notes")} /></Field>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
         <button style={Btn.secondary} onClick={close}>Cancel</button>
-        <button style={Btn.primary} onClick={submit}>{existing ? "Save changes" : "Save expense"}</button>
+        <button style={Btn.primary} disabled={saving} onClick={submit}>{saving ? "Saving…" : existing ? "Save changes" : "Save expense"}</button>
       </div>
     </ModalShell>
   );

@@ -6,19 +6,24 @@
   "private": true,
   "main": "electron/main.js",
   "scripts": {
+    "postinstall": "electron-rebuild -f -w better-sqlite3-multiple-ciphers",
+    "rebuild": "electron-rebuild -f -w better-sqlite3-multiple-ciphers",
     "dev:vite": "vite",
     "dev:electron": "electron .",
     "dev": "concurrently -k \"npm:dev:vite\" \"wait-on http://localhost:5173 && npm run dev:electron\"",
     "build": "vite build",
-    "dist": "npm run build && electron-builder --win --publish never"
+    "dist": "npm run build && electron-builder --win --publish never",
+    "dist:mac": "npm run build && electron-builder --mac --publish never"
   },
   "dependencies": {
+    "better-sqlite3-multiple-ciphers": "^11.10.0",
     "lucide-react": "^0.383.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@electron/rebuild": "^3.7.2",
     "@vitejs/plugin-react": "^4.7.0",
     "concurrently": "^8.2.2",
     "electron": "^31.0.0",
@@ -33,6 +38,9 @@
       "dist/**/*",
       "electron/**/*"
     ],
+    "asarUnpack": [
+      "node_modules/better-sqlite3-multiple-ciphers/**/*"
+    ],
     "directories": {
       "output": "release"
     },
@@ -44,6 +52,33 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "deleteAppDataOnUninstall": false
+    },
+    "mac": {
+      "category": "public.app-category.finance",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "minimumSystemVersion": "10.15.0",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "electron/entitlements.mac.plist",
+      "entitlementsInherit": "electron/entitlements.mac.plist"
+    },
+    "dmg": {
+      "sign": false
     }
   }
 }

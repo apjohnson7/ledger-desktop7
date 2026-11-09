@@ -1,155 +1,147 @@
-const { app, BrowserWindow, ipcMain, safeStorage } = require("electron");
+const { app, BrowserWindow, ipcMain, safeStorage, dialog, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const { openDatabase, getContext, close } = require("./db");
 
 // ----------------------------------------------------------------------------
 // DATA SAFETY
 //
-// All of the app's data lives in one file inside the user's normal per-app
-// data folder (e.g. C:\Users\<name>\AppData\Roaming\Ledger on Windows).
-// That folder is completely separate from the installed program files, so a
-// fresh installer over an existing install (an "update") does NOT touch it,
-// the same way updating any normal Windows app doesn't erase your
-// documents. Data only moves if the app's productName/appId in
-// package.json changes between builds, since that changes the folder name,
-// so keep those the same across versions.
+// The live ledger is a SQLCipher-encrypted SQLite database in the user's
+// normal per-app data folder (e.g. C:\Users\<name>\AppData\Roaming\Ledger on
+// Windows), separate from the installed program files. Updating the app never
+// touches that folder. The database key is kept in ledger.key, encrypted with
+// Electron's safeStorage (Windows DPAPI, macOS Keychain, or the Linux keyring)
+// when the operating system supports it.
 //
-// ENCRYPTION AT REST: the file on disk is encrypted using Electron's
-// safeStorage, which hands off to the operating system's own secure
-// storage (Windows Credential Manager/DPAPI, macOS Keychain, or the
-// Linux keyring). This ties the encryption to the current Windows user
-// account on this specific computer, so a raw copy of the file will not
-// open on a different machine or account, moving to a new computer needs
-// the in-app "Download full backup" export instead (Settings page), which
-// produces a portable, unencrypted file you can restore anywhere. If
-// OS-level encryption isn't available on a given machine (some minimal
-// Linux setups without a keyring), the app automatically falls back to
-// writing the file in plain JSON rather than failing to start.
-//
-// On top of that, every time the app starts (and before every save) it
-// keeps a small rolling history of backups in a "backups" subfolder, so
-// there's always a recent recovery point even if the main file is ever
-// corrupted or accidentally cleared.
+// BACKUPS: automatic recovery points are readable JSON files in backups/.
+// They contain everything (borrowers, loans, payments, users, settings, ...)
+// and can be restored on any machine from Settings > Restore from backup file.
+// The old single-file store (ledger-store.dat / ledger-store.json) is imported
+// once on first launch and then deliberately left in place as extra safety.
 // ----------------------------------------------------------------------------
 
 const userDataDir = () => app.getPath("userData");
-const storeFile = () => path.join(userDataDir(), "ledger-store.dat");
-const legacyPlainStoreFile = () => path.join(userDataDir(), "ledger-store.json");
 const backupsDir = () => path.join(userDataDir(), "backups");
-const MAX_BACKUPS = 20;
 
-function loadStore() {
-  const encAvailable = safeStorage.isEncryptionAvailable();
-
-  // Current format: encrypted binary file.
+/** Converts older encrypted .bak backups into readable .json files. */
+function migrateLegacyBackups() {
   try {
-    if (fs.existsSync(storeFile())) {
-      const raw = fs.readFileSync(storeFile());
-      const json = encAvailable ? safeStorage.decryptString(raw) : raw.toString("utf-8");
-      return JSON.parse(json);
+    const dir = backupsDir();
+    if (!fs.existsSync(dir)) return;
+    const legacyFiles = fs
+      .readdirSync(dir)
+      .filter((f) => /^ledger-store\..+\.bak$/.test(f));
+
+    for (const name of legacyFiles) {
+      const src = path.join(dir, name);
+      const dest = path.join(dir, name.replace(/\.bak$/, ".json"));
+      try {
+        if (!fs.existsSync(dest)) {
+          const raw = fs.readFileSync(src);
+          let store = null;
+          if (safeStorage && safeStorage.isEncryptionAvailable()) {
+            try {
+              store = JSON.parse(safeStorage.decryptString(raw));
+            } catch (e) {
+              store = null;
+            }
+          }
+          if (!store) store = JSON.parse(raw.toString("utf8"));
+          fs.writeFileSync(dest, JSON.stringify(store, null, 2), "utf-8");
+        }
+        fs.unlinkSync(src);
+      } catch (e) {
+        console.error(`Could not convert backup ${name} to JSON:`, e);
+      }
     }
   } catch (e) {
-    console.error("Failed to read encrypted store, trying legacy file:", e);
-  }
-
-  // Legacy format: plain JSON from before encryption was added. Read it
-  // once, then it gets re-saved encrypted on the next write.
-  try {
-    if (fs.existsSync(legacyPlainStoreFile())) {
-      return JSON.parse(fs.readFileSync(legacyPlainStoreFile(), "utf-8"));
-    }
-  } catch (e) {
-    console.error("Failed to read legacy store:", e);
-  }
-
-  return {};
-}
-
-function saveStore(store) {
-  fs.mkdirSync(path.dirname(storeFile()), { recursive: true });
-  const json = JSON.stringify(store);
-  if (safeStorage.isEncryptionAvailable()) {
-    fs.writeFileSync(storeFile(), safeStorage.encryptString(json));
-  } else {
-    // No OS-level secure storage on this machine - write plain JSON so the
-    // app keeps working rather than losing data.
-    fs.writeFileSync(storeFile(), json, "utf-8");
-  }
-  // Once the new encrypted file exists, the old plain-text copy is
-  // redundant and would otherwise sit on disk unencrypted forever.
-  try {
-    if (fs.existsSync(legacyPlainStoreFile())) fs.unlinkSync(legacyPlainStoreFile());
-  } catch (e) { /* not critical */ }
-}
-
-/** Copies the current store into backups/ with a timestamped filename, then
- *  prunes older backups beyond MAX_BACKUPS. Safe to call often. */
-function writeBackup() {
-  try {
-    if (!fs.existsSync(storeFile())) return;
-    fs.mkdirSync(backupsDir(), { recursive: true });
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const dest = path.join(backupsDir(), `ledger-store.${stamp}.bak`);
-    fs.copyFileSync(storeFile(), dest);
-
-    const files = fs.readdirSync(backupsDir())
-      .filter((f) => f.startsWith("ledger-store."))
-      .sort(); // ISO timestamps sort chronologically as strings
-    const excess = files.length - MAX_BACKUPS;
-    if (excess > 0) {
-      files.slice(0, excess).forEach((f) => {
-        try { fs.unlinkSync(path.join(backupsDir(), f)); } catch (e) { /* ignore */ }
-      });
-    }
-  } catch (e) {
-    // Backups are a safety net, not critical path - never let a backup
-    // failure block the app from starting or saving.
-    console.error("Backup failed:", e);
+    console.error("Backup migration failed:", e);
   }
 }
 
-const scopedKey = (key, shared) => `${shared ? "shared" : "personal"}:${key}`;
+let dbCtx = null;
 
-ipcMain.handle("storage:get", (_event, key, shared) => {
-  const store = loadStore();
-  const k = scopedKey(key, shared);
-  if (!(k in store)) throw new Error(`Key not found: ${key}`);
-  return { key, value: store[k], shared: !!shared };
-});
+/** Only query and mutation functions (plus auth) may be invoked from the
+ *  renderer. Bookkeeping helpers such as backup.stop are never exposed. */
+function exposedMethods() {
+  const ctx = getContext();
+  const map = new Map();
+  for (const name of Object.keys(ctx.queries)) {
+    map.set(name, (...args) => ctx.queries[name](...args));
+  }
+  for (const name of Object.keys(ctx.mutations)) {
+    map.set(name, (...args) => ctx.mutations[name](...args));
+  }
+  for (const name of ["login", "logout", "changePassword"]) {
+    map.set(`auth.${name}`, (...args) => ctx.auth[name](...args));
+  }
+  return map;
+}
 
-ipcMain.handle("storage:set", (_event, key, value, shared) => {
-  const store = loadStore();
-  store[scopedKey(key, shared)] = value;
-  saveStore(store);
-  writeBackup();
-  return { key, value, shared: !!shared };
-});
+function registerIpc() {
+  const ctx = getContext();
+  const methods = exposedMethods();
+  const readOnly = new Set(Object.keys(ctx.queries));
 
-ipcMain.handle("storage:delete", (_event, key, shared) => {
-  const store = loadStore();
-  const k = scopedKey(key, shared);
-  const deleted = k in store;
-  delete store[k];
-  saveStore(store);
-  writeBackup();
-  return { key, deleted, shared: !!shared };
-});
+  ipcMain.handle("ledger:call", async (_event, method, params) => {
+    // Rebuild the map lazily from the live context; getContext() throws if the
+    // database was closed while the window still existed.
+    getContext();
+    const fn = methods.get(String(method));
+    if (!fn) throw new Error(`Unknown ledger method: ${method}`);
+    const result = await fn(params || {});
+    if (!readOnly.has(String(method)) && ctx.backup) {
+      ctx.backup.noteChange();
+    }
+    return result;
+  });
 
-ipcMain.handle("storage:list", (_event, prefix, shared) => {
-  const store = loadStore();
-  const scopePrefix = `${shared ? "shared" : "personal"}:`;
-  const keys = Object.keys(store)
-    .filter((k) => k.startsWith(scopePrefix))
-    .map((k) => k.slice(scopePrefix.length))
-    .filter((k) => !prefix || k.startsWith(prefix));
-  return { keys, prefix: prefix || undefined, shared: !!shared };
-});
+  ipcMain.handle("ledger:backupInfo", () => ctx.backup.info());
 
-// Lets the renderer show where backups live and open that folder directly.
-ipcMain.handle("storage:backupInfo", () => ({
-  storeFile: storeFile(),
-  backupsDir: backupsDir(),
-}));
+  ipcMain.handle("ledger:backupNow", async () => {
+    const result = await ctx.backup.createAutoBackup("manual");
+    return { ok: true, ...result };
+  });
+
+  ipcMain.handle("ledger:backupExport", async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const stamp = new Date().toISOString().slice(0, 10);
+    const { canceled, filePath } = await dialog.showSaveDialog(win, {
+      title: "Save a full Ledger backup",
+      defaultPath: path.join(
+        app.getPath("documents"),
+        `ledger-backup-${stamp}.json`
+      ),
+      filters: [{ name: "Ledger backup", extensions: ["json"] }],
+    });
+    if (canceled || !filePath) return { ok: false, canceled: true };
+    const result = await ctx.backup.exportToFile(filePath, { reason: "manual" });
+    return { ok: true, path: filePath, size: result.size };
+  });
+
+  ipcMain.handle("ledger:backupRestore", async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+      title: "Restore Ledger from a backup",
+      properties: ["openFile"],
+      filters: [
+        { name: "Ledger backup", extensions: ["json"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (canceled || !filePaths || !filePaths[0]) {
+      return { ok: false, canceled: true };
+    }
+    const result = await ctx.backup.restoreFromFile(filePaths[0]);
+    return { ok: true, path: filePaths[0], counts: result.counts || {} };
+  });
+
+  ipcMain.handle("ledger:openFolder", async (_event, which) => {
+    const target = which === "database" ? userDataDir() : ctx.backupsDir;
+    const error = await shell.openPath(target);
+    return { ok: !error, error: error || null, path: target };
+  });
+}
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -175,15 +167,44 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
-  // Take a backup on every launch too, so upgrading to a new version (which
-  // relaunches the app) always leaves a "before this session" recovery
-  // point, on top of the backup taken after every save.
-  writeBackup();
+  try {
+    migrateLegacyBackups();
+    dbCtx = openDatabase({
+      userData: userDataDir(),
+      safeStorage,
+      onProgress: (counts) =>
+        console.log("Legacy ledger import finished:", counts),
+    });
+    registerIpc();
+    dbCtx.api.backup.start();
+  } catch (error) {
+    console.error("Could not open the ledger database:", error);
+    dialog.showErrorBox(
+      "Ledger could not start",
+      `${error && error.message ? error.message : error}\n\n` +
+        "Your data has not been changed. If the database is damaged, restore a JSON backup from the app's backups folder:\n" +
+        backupsDir()
+    );
+    app.quit();
+    return;
+  }
 
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+app.on("will-quit", () => {
+  try {
+    if (dbCtx) {
+      dbCtx.api.backup.stop();
+      close();
+    }
+  } catch (e) {
+    /* ignore */
+  }
+  dbCtx = null;
 });
 
 app.on("window-all-closed", () => {
