@@ -4,9 +4,13 @@ import {
   Search, Plus, X, ChevronRight, Phone, MapPin, Briefcase, AlertTriangle, CheckCircle2,
   Clock, ArrowLeft, Edit2, Ban, Camera, FileText, ChevronDown, Calendar, DollarSign,
   TrendingUp, ShieldCheck, PackageCheck, Menu, RefreshCw, Landmark, ArrowDownCircle, ArrowUpCircle, Bell, History,
-  Download, FileSpreadsheet, FileType, Trash2
+  Download, FileSpreadsheet, FileType, Trash2, Coins
 } from "lucide-react";
 import * as XLSX from "xlsx";
+import loginHero from "./assets/login-hero.jpg";
+import loginHeroAmbient from "./assets/login-hero-ambient.jpg";
+import loginHeroMirror from "./assets/login-hero-mirror.jpg";
+import interTightFont from "./assets/fonts/InterTight-latin.woff2";
 
 /* ============================================================================
    LEDGER, a money lending management system
@@ -16,12 +20,56 @@ import * as XLSX from "xlsx";
    feel like a well-kept physical ledger book that happens to be digital.
    ============================================================================ */
 
-const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700;800&display=swap');`;
+/* Bundled locally so the offline ledger never calls out to a font CDN. */
+const FONT_IMPORT = `
+@font-face {
+  font-family: 'Inter Tight';
+  font-style: normal;
+  font-weight: 500 800;
+  font-display: swap;
+  src: url('${interTightFont}') format('woff2');
+}`;
 
-const CURRENCY = "UGX";
+/* The display currency is a business-wide setting. It changes the label on
+   every figure, not the stored numbers: this app is offline, so there are no
+   live exchange rates to convert historical amounts with. */
+const CURRENCY_OPTIONS = [
+  { code: "UGX", name: "Ugandan Shilling", locale: "en-UG" },
+  { code: "KES", name: "Kenyan Shilling", locale: "en-KE" },
+  { code: "TZS", name: "Tanzanian Shilling", locale: "en-TZ" },
+  { code: "RWF", name: "Rwandan Franc", locale: "en-RW" },
+  { code: "BIF", name: "Burundian Franc", locale: "en-BI" },
+  { code: "SSP", name: "South Sudanese Pound", locale: "en-SS" },
+  { code: "CDF", name: "Congolese Franc", locale: "en-CD" },
+  { code: "ETB", name: "Ethiopian Birr", locale: "en-ET" },
+  { code: "SOS", name: "Somali Shilling", locale: "en-SO" },
+  { code: "USD", name: "US Dollar", locale: "en-US" },
+  { code: "EUR", name: "Euro", locale: "en-IE" },
+  { code: "GBP", name: "British Pound", locale: "en-GB" },
+];
+const CURRENCY_BY_CODE = Object.fromEntries(CURRENCY_OPTIONS.map((c) => [c.code, c]));
+let activeCurrencyCode = "UGX";
+const currencyFormatters = new Map();
+
+function setActiveCurrency(code) {
+  activeCurrencyCode = CURRENCY_BY_CODE[code] ? code : "UGX";
+}
+
 const fmt = (n) => {
   const v = Math.round(Number(n) || 0);
-  return `${CURRENCY} ${v.toLocaleString("en-UG")}`;
+  const info = CURRENCY_BY_CODE[activeCurrencyCode] || CURRENCY_BY_CODE.UGX;
+  let formatter = currencyFormatters.get(info.code);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat(info.locale, {
+      style: "currency",
+      currency: info.code,
+      currencyDisplay: "code",
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 0,
+    });
+    currencyFormatters.set(info.code, formatter);
+  }
+  return formatter.format(v);
 };
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
@@ -229,9 +277,9 @@ const TR = {
   reason: { en: "Reason", lg: "Ensonga", nyn: "Enshonga" },
 
   settingsHint: {
-    en: "Currency is fixed to Ugandan Shillings (UGX). All figures on the dashboard and reports are calculated automatically from your borrowers, loans, payments, and expenses, nothing here needs manual upkeep. Records are never permanently deleted: use Void on a loan, payment, or expense to correct mistakes while keeping a full history.",
-    lg: "Ssente ye Uganda Shillings (UGX). Ebibalo byonna ku lupapula lw'ekika ne lipoota bibalirirwa byokka okuva mu beewola, ebbanja, okusasula, n'ebisale, tewali kya kukola bugazi. Ebiwandiikiddwa tebisangulwa ddala: kozesa Void ku bbanja, okusasula, oba ensasulo okutereeza ensobi nga obulambulukufu bwonna bukyakuumiddwa.",
-    nyn: "Sente ye Uganda Shillings (UGX). Ebibarirwa byoona aha rupapura n'omu ripoota nibibarirwa byonka kuruga aha beegura, ebbanja, okushasura, n'ebishasuro, tihariho eky'okukora n'engaro. Ebihandiikirwe tibisangurwaho rundi: koresa Void aha bbanja, okushasura, nari ekishasuro kuhindura enshobo waaba nooshigikiirira amakuru goona."
+    en: "The display currency can be changed at any time from the currency button in the top bar. All figures on the dashboard and reports are calculated automatically from your borrowers, loans, payments, and expenses, nothing here needs manual upkeep. Records are never permanently deleted: use Void on a loan, payment, or expense to correct mistakes while keeping a full history.",
+    lg: "Ensimbi ez'okulaga zisobola okukyusibwa buli kiseera okuva ku kifaananyi ky'ensimbi ku mutwe. Ebibalo byonna ku lupapula lw'ekika ne lipoota bibalirirwa byokka okuva mu beewola, ebbanja, okusasula, n'ebisale, tewali kya kukola bugazi. Ebiwandiikiddwa tebisangulwa ddala: kozesa Void ku bbanja, okusasula, oba ensasulo okutereeza ensobi nga obulambulukufu bwonna bukyakuumiddwa.",
+    nyn: "Enshoro ez'okureeba zisobola kuhindurwa obwire bwona kuruga aha kishushani ky'enshoro aha mutwe. Ebibarirwa byoona aha rupapura n'omu ripoota nibibarirwa byonka kuruga aha beegura, ebbanja, okushasura, n'ebishasuro, tihariho eky'okukora n'engaro. Ebihandiikirwe tibisangurwaho rundi: koresa Void aha bbanja, okushasura, nari ekishasuro kuhindura enshobo waaba nooshigikiirira amakuru goona."
   },
   photoUploadNote: {
     en: "Photo and document upload isn't available in this preview, the record is saved with the details above.",
@@ -290,14 +338,12 @@ export default function App() {
   const [boot, setBoot] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [bootError, setBootError] = useState(null);
-  const [currentUser, setCurrentUser] = useState(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(SESSION_KEY));
-      return saved && saved.id ? saved : null;
-    } catch (e) {
-      return null;
-    }
-  });
+  const [publicSettings, setPublicSettings] = useState(null);
+  const [defaultPasswordWarning, setDefaultPasswordWarning] = useState(false);
+  // Only a hint for the loading screen. The real identity lives in the main
+  // process and is confirmed through auth.session below; localStorage alone
+  // must never grant access.
+  const [currentUser, setCurrentUser] = useState(null);
   const [page, setPage] = useState("dashboard");
   const [navOpen, setNavOpen] = useState(false);
   const [searchQ, setSearchQ] = useState("");
@@ -307,6 +353,10 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const [version, setVersion] = useState(0);
   const [showNotifications, setShowNotifications] = useState(false);
+
+  // Every money label formats through the saved display currency. Before
+  // sign-in only the public business settings are available.
+  setActiveCurrency(boot?.settings?.currency || publicSettings?.currency);
 
   const showToast = useCallback((msg) => {
     setToast(msg);
@@ -340,18 +390,55 @@ export default function App() {
     return b;
   }, [showToast]);
 
+  // Before sign-in, read only the public business settings (name, currency,
+  // language). Borrower, loan, and user data stay behind the main process's
+  // authenticated session. Also confirm that a saved session still exists in
+  // the main process; localStorage by itself is not proof of sign-in.
   useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      let settingsError = null;
+      try {
+        const settings = await api().settings();
+        if (!cancelled) setPublicSettings(settings);
+      } catch (error) {
+        settingsError = error;
+      }
+
+      try {
+        const saved = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
+        if (saved && saved.id) {
+          const session = await api().auth.session();
+          if (session && session.user) {
+            if (!cancelled) {
+              setCurrentUser(session.user);
+              setDefaultPasswordWarning(!!session.defaultPassword);
+            }
+          } else {
+            localStorage.removeItem(SESSION_KEY);
+          }
+        }
+      } catch (e) {
+        localStorage.removeItem(SESSION_KEY);
+      }
+
+      if (!cancelled) {
+        if (settingsError) setBootError(settingsError);
+        setLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!currentUser) return;
     loadBootstrap().catch((error) => {
       setBootError(error);
       setLoaded(true);
     });
-  }, [loadBootstrap]);
-
-  useEffect(() => {
-    if (version > 0) {
-      loadBootstrap().catch((error) => setBootError(error));
-    }
-  }, [version, loadBootstrap]);
+  }, [currentUser, version, loadBootstrap]);
 
   const notifShownRef = useRef(false);
   useEffect(() => {
@@ -376,21 +463,39 @@ export default function App() {
       <div style={{ ...S.page, display: "flex", alignItems: "center", justifyContent: "center", height: "100%", minHeight: 480, padding: 24 }}>
         <Card style={{ maxWidth: 560 }}>
           <div style={{ ...displayFont, fontSize: 22, fontWeight: 600, marginBottom: 8 }}>The ledger could not be opened</div>
-          <div style={{ fontSize: 15, color: C.ink2, lineHeight: 1.6 }}>{bootError.message || String(bootError)}</div>
+          <div style={{ fontSize: 15, color: C.ink2, lineHeight: 1.6, marginBottom: 16 }}>{bootError.message || String(bootError)}</div>
+          <div style={{ fontSize: 14, color: C.ink3, lineHeight: 1.6, marginBottom: 16 }}>
+            Your saved data has not been changed. Try opening the ledger again; if the problem continues, open the backups folder and keep a copy of your latest backup before restoring it from Settings.
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button style={Btn.primary} onClick={() => window.location.reload()}>Try again</button>
+            <button style={Btn.secondary} onClick={() => window.ledger?.backup?.openFolder("backups")}>Open backups folder</button>
+          </div>
         </Card>
       </div>
     );
   }
 
   if (!currentUser) {
-    const handleLogin = (user) => {
+    const handleLogin = (user, result) => {
       localStorage.setItem(SESSION_KEY, JSON.stringify(user));
       setCurrentUser(user);
+      setDefaultPasswordWarning(!!result?.defaultPassword);
+      setBoot(null);
+      setBootError(null);
       setPage("dashboard");
       notifShownRef.current = false;
-      refresh();
     };
-    return <LoginScreen businessName={boot?.settings?.businessName} onLogin={handleLogin} />;
+    return <LoginScreen businessName={publicSettings?.businessName || boot?.settings?.businessName} onLogin={handleLogin} />;
+  }
+
+  if (!boot) {
+    return (
+      <div style={{ ...S.page, display: "flex", alignItems: "center", justifyContent: "center", height: "100%", minHeight: 480 }}>
+        <style>{FONT_IMPORT}</style>
+        <div style={{ fontFamily: "'Times New Roman', Times, serif", color: C.ink3 }}>Opening the ledger…</div>
+      </div>
+    );
   }
 
   const role = ROLES[currentUser.role] || ROLES.Viewer;
@@ -415,14 +520,39 @@ export default function App() {
     localStorage.removeItem(SESSION_KEY);
     notifShownRef.current = false;
     setCurrentUser(null);
+    setDefaultPasswordWarning(false);
+    setBoot(null);
     setPage("dashboard");
     setShowNotifications(false);
+    setModal(null);
+  };
+
+  const changeCurrency = async (code) => {
+    if (!CURRENCY_BY_CODE[code] || code === (boot?.settings?.currency || "UGX")) return;
+    // Update the screen immediately; the database write follows.
+    setBoot((b) => (b ? { ...b, settings: { ...b.settings, currency: code } } : b));
+    try {
+      const result = await api().settingsUpdate({
+        actor: actorOf(currentUser),
+        settings: { currency: code },
+      });
+      if (!result?.ok) {
+        showToast(result?.error || "Could not change the display currency.");
+        refresh();
+        return;
+      }
+      showToast(`Display currency changed to ${code}.`);
+    } catch (e) {
+      showToast(e.message || "Could not change the display currency.");
+      refresh();
+    }
   };
 
   const ctx = {
     boot, update: refresh, refresh, showToast, goBorrower, goLoan, setModal, setPage,
     currentUser, role, t, version, actor: actorOf(currentUser),
     alertCount: boot?.alertCount || 0,
+    onPasswordChanged: () => setDefaultPasswordWarning(false),
   };
 
   const safePage = (allowedPages.includes(page) || (page === "borrower-detail" && allowedPages.includes("borrowers")) || (page === "loan-detail" && allowedPages.includes("loans"))) ? page : "dashboard";
@@ -460,9 +590,23 @@ export default function App() {
           alertCount={boot?.alertCount || 0}
           onOpenNotifications={() => setShowNotifications(true)}
           setModal={setModal}
+          currency={boot?.settings?.currency || "UGX"}
+          onCurrencyChange={changeCurrency}
         />
 
         <div style={{ padding: "20px 24px 60px", maxWidth: 1180, margin: "0 auto" }}>
+          {defaultPasswordWarning && (
+            <Card style={{ marginBottom: 16, background: "#FFF6E2", border: "1px solid #E7D3A8" }}>
+              <div style={{ display: "flex", gap: 14, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" }}>
+                <div style={{ fontSize: 14.5, color: "#7A5A1E", lineHeight: 1.55, minWidth: 260, flex: 1 }}>
+                  <b>You are still using the default administrator password.</b> Anyone who knows it can open this ledger. Change it before entering real borrower data.
+                </div>
+                <button style={Btn.primary} onClick={() => setModal({ type: "changePassword" })}>
+                  Change password
+                </button>
+              </div>
+            </Card>
+          )}
           {boot?.migrationError && (
             <Card style={{ marginBottom: 16, background: C.rustSoft, border: "1px solid #E3C3BB" }}>
               <div style={{ fontSize: 14.5, color: C.rust }}>
@@ -615,9 +759,10 @@ function Sidebar({ page, setPage, navOpen, setNavOpen, businessName, allowedPage
   );
 }
 
-function TopBar({ searchQ, setSearchQ, onOpenNav, onQuickAction, currentUser, onLogout, allowedPages, alertCount, onOpenNotifications, setModal }) {
+function TopBar({ searchQ, setSearchQ, onOpenNav, onQuickAction, currentUser, onLogout, allowedPages, alertCount, onOpenNotifications, setModal, currency, onCurrencyChange }) {
   const [showAdd, setShowAdd] = useState(false);
   const [showUser, setShowUser] = useState(false);
+  const [showCurrency, setShowCurrency] = useState(false);
   return (
     <div style={{
       position: "sticky", top: 0, zIndex: 20, background: C.paper, borderBottom: `1px solid ${C.border}`,
@@ -638,6 +783,64 @@ function TopBar({ searchQ, setSearchQ, onOpenNav, onQuickAction, currentUser, on
         {searchQ && <X size={14} color={C.ink3} style={{ cursor: "pointer" }} onClick={() => setSearchQ("")} />}
       </div>
       <div style={{ flex: 1 }} />
+
+      <div style={{ position: "relative", flexShrink: 0 }}>
+        <button
+          type="button"
+          title="Change display currency"
+          aria-label={`Change display currency (currently ${currency})`}
+          onClick={() => setShowCurrency((v) => !v)}
+          style={{
+            display: "flex", alignItems: "center", gap: 7, height: 38, padding: "0 11px",
+            borderRadius: 8, border: `1px solid ${C.border}`, background: C.surface,
+            color: C.ink2, cursor: "pointer", fontFamily: "'Inter Tight', sans-serif",
+            fontSize: 14.5, fontWeight: 600, letterSpacing: 0.1,
+          }}
+        >
+          <Coins size={15} color={C.brassDark} />
+          {currency}
+          <ChevronDown size={12} color={C.ink3} />
+        </button>
+        {showCurrency && (
+          <div style={{
+            position: "absolute", right: 0, top: "115%", background: C.surface, border: `1px solid ${C.border}`,
+            borderRadius: 10, boxShadow: "0 10px 30px rgba(31,42,36,0.16)", width: 258, zIndex: 50, overflow: "hidden"
+          }}>
+            <div style={{
+              padding: "9px 14px", fontSize: 12.5, fontWeight: 700, letterSpacing: 0.5,
+              textTransform: "uppercase", color: C.ink3, borderBottom: `1px solid ${C.border}`, background: C.bg
+            }}>
+              Display currency
+            </div>
+            <div style={{ maxHeight: 320, overflowY: "auto" }} className="lm-scroll">
+              {CURRENCY_OPTIONS.map((c) => {
+                const active = c.code === currency;
+                return (
+                  <div
+                    key={c.code}
+                    onClick={() => { setShowCurrency(false); if (!active) onCurrencyChange(c.code); }}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 10, padding: "9px 14px",
+                      cursor: "pointer", background: active ? C.brassSoft : "transparent",
+                      borderBottom: `1px solid ${C.border}`,
+                    }}
+                    onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = C.forestSoft; }}
+                    onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = "transparent"; }}
+                  >
+                    <span style={{ width: 42, ...displayFont, fontSize: 14, fontWeight: 700, color: active ? C.brassDark : C.forestDark }}>{c.code}</span>
+                    <span style={{ flex: 1, fontSize: 14.5, color: C.ink2 }}>{c.name}</span>
+                    {active && <CheckCircle2 size={15} color={C.brassDark} />}
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ padding: "9px 14px", fontSize: 12.5, lineHeight: 1.45, color: C.ink3, background: C.bg }}>
+              Changes the label on every figure. Existing amounts are not converted.
+            </div>
+          </div>
+        )}
+      </div>
+
       <div onClick={onOpenNotifications} style={{
         position: "relative", width: 38, height: 38, borderRadius: "50%", border: `1px solid ${C.border}`,
         background: C.surface, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0
@@ -2359,6 +2562,56 @@ function SettingsPage({ boot, update, showToast, t, actor }) {
 
 /* ---------------------------------- users & login ----------------------------------- */
 
+function LedgerSeal({ size = 82 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 96 96" role="img" aria-label="Ledger">
+      <defs>
+        <radialGradient id="lgSealBg" cx="34%" cy="26%" r="86%">
+          <stop offset="0%" stopColor="#FFFEF9" />
+          <stop offset="58%" stopColor="#F8F1E1" />
+          <stop offset="100%" stopColor="#EDE1C9" />
+        </radialGradient>
+        <linearGradient id="lgSealInk" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stopColor="#2F5B3F" />
+          <stop offset="55%" stopColor="#5C7A4A" />
+          <stop offset="100%" stopColor="#B4863A" />
+        </linearGradient>
+      </defs>
+      <circle cx="48" cy="48" r="46" fill="url(#lgSealBg)" stroke="rgba(180,134,58,0.5)" strokeWidth="1.1" />
+      <circle cx="48" cy="48" r="40" fill="none" stroke="rgba(180,134,58,0.16)" strokeWidth="1" />
+      <g fill="none" stroke="url(#lgSealInk)" strokeWidth="1.6" opacity="0.9">
+        <ellipse cx="48" cy="48" rx="31" ry="13" />
+        <ellipse cx="48" cy="48" rx="31" ry="13" transform="rotate(60 48 48)" />
+        <ellipse cx="48" cy="48" rx="31" ry="13" transform="rotate(120 48 48)" />
+      </g>
+      <g fill="#B4863A">
+        <circle cx="48" cy="48" r="3.6" />
+        <circle cx="75.5" cy="33.5" r="2.3" opacity="0.9" />
+        <circle cx="27" cy="63.5" r="1.9" opacity="0.75" />
+        <circle cx="66" cy="70" r="1.5" opacity="0.65" />
+      </g>
+    </svg>
+  );
+}
+
+/** The sign-in backdrop: the jar-of-coins photo shown whole across the top,
+ *  a blurred mirror of its left edge filling the spare width, and the app's
+ *  brass secondary colour across the bottom. */
+function LoginBackdrop() {
+  return (
+    <div className="lg-backdrop" aria-hidden="true">
+      <div className="lg-photo">
+        <div className="lg-photo-wash" style={{ backgroundImage: `url(${loginHeroAmbient})` }} />
+        <div className="lg-photo-strip">
+          <img className="lg-photo-mirror" src={loginHeroMirror} alt="" draggable="false" />
+          <img className="lg-photo-frame" src={loginHero} alt="" draggable="false" />
+        </div>
+      </div>
+      <div className="lg-lower" />
+    </div>
+  );
+}
+
 function LoginScreen({ businessName, onLogin }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -2379,7 +2632,7 @@ function LoginScreen({ businessName, onLogin }) {
         return;
       }
       setError("");
-      onLogin(result.user);
+      onLogin(result.user, result);
     } catch (e) {
       setError(e.message || "Could not sign in.");
     } finally {
@@ -2387,31 +2640,231 @@ function LoginScreen({ businessName, onLogin }) {
     }
   };
 
-  const onKeyDown = (e) => { if (e.key === "Enter") submit(); };
-
   return (
-    <div style={{ ...S.page, minHeight: "100%", display: "flex", alignItems: "center", justifyContent: "center", padding: "40px 16px" }}>
+    <div className="lg-page">
       <style>{`${FONT_IMPORT}
         * { box-sizing: border-box; }
-        input { font-family: 'Times New Roman', Times, serif; font-size: 16px; }
-        input:focus { outline: 2px solid ${C.brass}; outline-offset: 1px; }
+        html, body, #root { height: 100%; }
+        .lg-page {
+          position: relative; min-height: 100vh; width: 100%;
+          display: flex; align-items: flex-start; justify-content: center;
+          padding: clamp(30px, 6vh, 64px) 24px 48px;
+          overflow: hidden;
+          font-family: 'Inter Tight', sans-serif;
+          background: ${C.brass};
+        }
+        .lg-backdrop { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+
+        /* Upper 62%: the jar-of-coins photo shown whole, never cropped.
+           A blurred copy of the same photo softly fills the spare width. */
+        .lg-photo {
+          position: absolute; top: 0; left: 0; right: 0; height: 62%;
+          overflow: hidden;
+          background: #0B2BB4;
+        }
+        .lg-photo-wash {
+          position: absolute; inset: -4%;
+          background-size: cover;
+          background-position: center;
+        }
+        .lg-photo-strip {
+          position: absolute; top: 0; right: 0; height: 100%;
+          display: flex; align-items: stretch; flex-wrap: nowrap;
+        }
+        .lg-photo-strip img {
+          display: block; height: 100%; width: auto; max-width: none; flex: 0 0 auto;
+          user-select: none;
+        }
+        /* The mirror continues the photo's left edge into a soft, blurred
+           backdrop. Its baked-in blur means the seam is invisible and the
+           whole original photo stays visible, uncropped. */
+        .lg-photo-mirror { pointer-events: none; }
+        /* A gentle top shade for depth, and a warm edge into the brass. */
+        .lg-photo::after {
+          content: ''; position: absolute; inset: 0;
+          background:
+            linear-gradient(180deg, rgba(8, 20, 52, 0.16) 0%, rgba(8, 20, 52, 0) 26%),
+            linear-gradient(180deg, rgba(180, 134, 58, 0) 90%, rgba(180, 134, 58, 0.22) 100%);
+        }
+
+        /* Lower 38%: the app's secondary colour, in a soft brass gradient. */
+        .lg-lower {
+          position: absolute; left: 0; right: 0; bottom: 0; height: 38%;
+          background:
+            radial-gradient(120% 85% at 50% 0%, rgba(255, 246, 218, 0.18) 0%, rgba(255, 246, 218, 0) 60%),
+            linear-gradient(180deg, #C1964A 0%, #B4863A 38%, #A47A31 100%);
+          box-shadow: inset 0 1px 0 rgba(255, 247, 222, 0.55);
+        }
+        /* Faint ledger ruling on the brass so the lower panel isn't flat. */
+        .lg-lower::before {
+          content: ''; position: absolute; inset: 0;
+          background: repeating-linear-gradient(
+            180deg,
+            rgba(92, 64, 20, 0.07) 0px,
+            rgba(92, 64, 20, 0.07) 1px,
+            transparent 1px,
+            transparent 34px
+          );
+          opacity: 0.5;
+        }
+
+        .lg-card {
+          position: relative; z-index: 2;
+          width: min(430px, 100%);
+          padding: 32px 38px 30px;
+          border-radius: 20px;
+          background: rgba(255, 254, 250, 0.98);
+          border: 1px solid rgba(180, 134, 58, 0.14);
+          box-shadow:
+            0 18px 45px rgba(3, 30, 18, 0.17),
+            0 2px 8px rgba(3, 30, 18, 0.05),
+            inset 0 1px 0 rgba(255, 255, 255, 0.95);
+          animation: lg-rise 0.55s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+        }
+        .lg-card::before {
+          content: ''; position: absolute; top: 0; left: 26px; right: 26px; height: 1.5px;
+          border-radius: 2px;
+          background: linear-gradient(90deg, transparent, #D9BD70 28%, #F3E2A8 50%, #D9BD70 72%, transparent);
+          opacity: 0.45;
+        }
+        @keyframes lg-rise {
+          from { opacity: 0; transform: translateY(14px) scale(0.985); }
+          to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        .lg-seal { display: flex; justify-content: center; margin: -2px 0 13px; filter: drop-shadow(0 4px 10px rgba(80, 60, 20, 0.12)); }
+        .lg-title {
+          margin: 0 0 28px; text-align: center;
+          font-family: 'Inter Tight', sans-serif; font-size: 33px; line-height: 1;
+          font-weight: 600; letter-spacing: -0.7px; color: #1D3B28;
+        }
+        .lg-field { margin-bottom: 17px; }
+        .lg-field label {
+          display: block; margin-bottom: 7px; text-align: center;
+          font-size: 14.5px; font-weight: 600; letter-spacing: 0.1px; color: #1D3B28;
+        }
+        .lg-field input {
+          width: 100%; height: 50px; padding: 0 14px;
+          border: 1.5px solid #E7D7B2; border-radius: 9px;
+          background: #FBF4E4; color: #1F2A1F;
+          font-family: 'Inter Tight', sans-serif; font-size: 16px;
+          transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+        }
+        .lg-field input::placeholder { color: #A89C83; }
+        .lg-field input:focus {
+          outline: none; border-color: #C9A227; background: #FFFBF2;
+          box-shadow: 0 0 0 3px rgba(201, 162, 39, 0.18);
+        }
+        .lg-error {
+          display: flex; align-items: flex-start; gap: 7px;
+          margin: -3px 0 13px; padding: 9px 11px;
+          border: 1px solid #ECCFC9; border-radius: 8px;
+          background: #FBF0ED; color: #9A3427;
+          font-size: 13.5px; line-height: 1.4;
+        }
+        .lg-submit {
+          width: 100%; height: 50px; margin-top: 5px;
+          border: none; border-radius: 9px; cursor: pointer;
+          background: linear-gradient(180deg, #1E4A31 0%, #123A24 100%);
+          color: #FFFFFF;
+          font-family: 'Inter Tight', sans-serif; font-size: 16.5px; font-weight: 700; letter-spacing: 0.1px;
+          box-shadow: 0 8px 18px rgba(18, 58, 36, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+          transition: transform 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+        }
+        .lg-submit:hover:not(:disabled) {
+          background: linear-gradient(180deg, #255B3D 0%, #16462B 100%);
+          transform: translateY(-1px);
+          box-shadow: 0 12px 24px rgba(18, 58, 36, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+        }
+        .lg-submit:active:not(:disabled) { transform: translateY(0); }
+        .lg-submit:disabled { opacity: 0.72; cursor: default; }
+        .lg-imprint {
+          position: absolute; z-index: 2; left: 50%; bottom: 14px; transform: translateX(-50%);
+          display: flex; align-items: center; gap: 9px; white-space: nowrap;
+          font-size: 10px; font-weight: 600; letter-spacing: 1.7px; text-transform: uppercase;
+          color: rgba(64, 43, 12, 0.62);
+        }
+        .lg-imprint b { font-weight: 700; color: rgba(48, 31, 6, 0.8); }
+        .lg-imprint i { width: 3px; height: 3px; border-radius: 50%; background: rgba(255, 247, 224, 0.9); opacity: 0.9; }
+
+        @media (max-width: 860px) {
+          .lg-photo { height: 58%; }
+          .lg-lower { height: 42%; }
+        }
+        @media (max-width: 520px) {
+          .lg-page { padding: 22px 16px 44px; }
+          .lg-card { padding: 27px 22px 25px; border-radius: 16px; }
+          .lg-title { font-size: 30px; margin-bottom: 22px; }
+          .lg-imprint { font-size: 9px; letter-spacing: 1.1px; }
+        }
+        @media (max-height: 760px) {
+          .lg-page { padding-top: 22px; padding-bottom: 34px; }
+          .lg-card { padding-top: 24px; padding-bottom: 22px; }
+          .lg-seal svg { width: 66px; height: 66px; }
+          .lg-seal { margin-bottom: 9px; }
+          .lg-title { font-size: 30px; margin-bottom: 20px; }
+          .lg-field { margin-bottom: 13px; }
+          .lg-field input, .lg-submit { height: 46px; }
+          .lg-imprint { bottom: 8px; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .lg-card { animation: none; }
+          .lg-submit { transition: none; }
+        }
       `}</style>
-      <div style={{
-        background: C.surface, border: `1px solid ${C.border}`, borderRadius: 14, padding: "34px 30px",
-        width: "100%", maxWidth: 380, boxShadow: "0 12px 40px rgba(31,42,36,0.12)"
-      }}>
-        <div style={{ textAlign: "center", marginBottom: 22 }}>
-          <div style={{ ...displayFont, fontSize: 30, fontWeight: 600, color: C.forestDark }}>Ledger</div>
-          <div style={{ fontSize: 15, color: C.ink3, marginTop: 4 }}>{businessName || "Sign in to open the books."}</div>
+
+      <LoginBackdrop />
+
+      <form
+        className="lg-card"
+        onSubmit={(e) => { e.preventDefault(); submit(); }}
+        noValidate
+      >
+        <div className="lg-seal"><LedgerSeal /></div>
+        <h1 className="lg-title">Ledger</h1>
+
+        <div className="lg-field">
+          <label htmlFor="login-username">Username</label>
+          <input
+            id="login-username"
+            name="username"
+            autoComplete="username"
+            autoCapitalize="none"
+            spellCheck={false}
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            autoFocus
+          />
         </div>
-        <Field label="Username">
-          <input style={FieldStyle.input} value={username} onChange={(e) => setUsername(e.target.value)} onKeyDown={onKeyDown} autoFocus />
-        </Field>
-        <Field label="Password">
-          <input type="password" style={FieldStyle.input} value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={onKeyDown} />
-        </Field>
-        {error && <div style={{ color: C.rust, fontSize: 14.5, marginBottom: 10 }}>{error}</div>}
-        <button type="button" onClick={submit} disabled={checking} style={{ ...Btn.primary, width: "100%", justifyContent: "center", padding: "11px 15px", marginTop: 6, opacity: checking ? 0.7 : 1 }}>{checking ? "Checking…" : "Sign in"}</button>
+
+        <div className="lg-field">
+          <label htmlFor="login-password">Password</label>
+          <input
+            id="login-password"
+            name="password"
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </div>
+
+        {error && (
+          <div className="lg-error" role="alert">
+            <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+            <span>{error}</span>
+          </div>
+        )}
+
+        <button type="submit" className="lg-submit" disabled={checking}>
+          {checking ? "Signing in…" : "Sign in"}
+        </button>
+      </form>
+
+      <div className="lg-imprint">
+        <b>{businessName || "Ledger"}</b>
+        <i />
+        <span>Local · Encrypted · Offline</span>
       </div>
     </div>
   );
@@ -2993,7 +3446,7 @@ function NotificationsModal({ overdueLoans, soonLoans, autoRenewedToday, close, 
   );
 }
 
-function ModalRouter({ modal, close, update, showToast, goBorrower, goLoan, setModal, currentUser, role, t, actor, boot, version }) {
+function ModalRouter({ modal, close, update, showToast, goBorrower, goLoan, setModal, currentUser, role, t, actor, boot, version, onPasswordChanged }) {
   if (modal.type === "borrower") return <BorrowerForm update={update} showToast={showToast} close={close} existing={modal.payload} goBorrower={goBorrower} actor={actor} />;
   if (modal.type === "loan") return <LoanForm update={update} showToast={showToast} close={close} payload={modal.payload} goLoan={goLoan} setModal={setModal} actor={actor} version={version} />;
   if (modal.type === "payment") return <PaymentForm update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} actor={actor} version={version} />;
@@ -3004,7 +3457,7 @@ function ModalRouter({ modal, close, update, showToast, goBorrower, goLoan, setM
   if (modal.type === "editLoan") return <EditLoanForm update={update} showToast={showToast} close={close} payload={modal.payload} actor={actor} version={version} />;
   if (modal.type === "fundReceived") return <FundReceivedForm update={update} showToast={showToast} close={close} existing={modal.payload} actor={actor} />;
   if (modal.type === "fundRepayment") return <FundRepaymentForm update={update} showToast={showToast} close={close} payload={modal.payload} existing={modal.payload?.existing} actor={actor} version={version} />;
-  if (modal.type === "changePassword") return <ChangePasswordForm showToast={showToast} close={close} currentUser={currentUser} />;
+  if (modal.type === "changePassword") return <ChangePasswordForm showToast={showToast} close={close} currentUser={currentUser} onPasswordChanged={onPasswordChanged} />;
   if (modal.type === "confirmDelete") return <ConfirmModal payload={modal.payload} close={close} />;
   return null;
 }
@@ -3096,7 +3549,7 @@ function confirmOrRequestDelete({ role, currentUser, update, showToast, setModal
   }
 }
 
-function ChangePasswordForm({ showToast, close, currentUser }) {
+function ChangePasswordForm({ showToast, close, currentUser, onPasswordChanged }) {
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -3115,6 +3568,7 @@ function ChangePasswordForm({ showToast, close, currentUser }) {
       });
       if (!result?.ok) return showToast(result?.error || "Could not change your password.");
       showToast("Password updated.");
+      if (onPasswordChanged) onPasswordChanged();
       close();
     } catch (e) {
       showToast(e.message || "Could not change your password.");
@@ -3856,7 +4310,7 @@ function LoanForm({ update, showToast, close, payload, goLoan, setModal, actor, 
       </div>
       {hasPaperworkFee && (
         <div style={{ background: C.bg, padding: 12, borderRadius: 8, marginBottom: 6, maxWidth: 260 }}>
-          <Field label="Paperwork cost" hint="Defaults to UGX 5,000, adjust if this loan is different">
+          <Field label="Paperwork cost" hint={`Defaults to ${fmt(DEFAULT_PAPERWORK_FEE)}, adjust if this loan is different`}>
             <input type="number" style={FieldStyle.input} value={paperworkFee} onChange={(e) => setPaperworkFee(e.target.value)} />
           </Field>
         </div>

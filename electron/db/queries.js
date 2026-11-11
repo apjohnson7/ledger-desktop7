@@ -1,6 +1,6 @@
 "use strict";
 
-const { getSettings, todayUtc, num } = require("./util");
+const { getSettings, todayUtc, num, text, idText } = require("./util");
 const {
   borrowerRow,
   loanRow,
@@ -201,7 +201,7 @@ function createQueries(ctx) {
 
   function borrowersPage(params = {}) {
     const { limit, page, offset } = pageArgs(params, 50);
-    const q = String(params.q || "").trim();
+    const q = text(params.q, 200);
     let where = "1 = 1";
     const bind = { limit, offset };
     if (q) {
@@ -261,7 +261,7 @@ function createQueries(ctx) {
   }
 
   function borrowerGet(params = {}) {
-    const id = params.id;
+    const id = idText(params.id);
     const today = todayUtc();
     const row = db
       .prepare(
@@ -333,7 +333,7 @@ function createQueries(ctx) {
    *  Unlike borrowerGet (which pages the loan history for the screen) this
    *  returns the complete history, bounded only as a safety valve. */
   function borrowerStatement(params = {}) {
-    const id = params.id;
+    const id = idText(params.id);
     const today = todayUtc();
     const row = db
       .prepare(
@@ -399,7 +399,7 @@ function createQueries(ctx) {
   }
 
   function borrowerPick(params = {}) {
-    const q = String(params.q || "").trim();
+    const q = text(params.q, 200);
     const limit = Math.min(Math.max(num(params.limit) || 20, 1), 50);
     const bind = { limit };
     let where = "1 = 1";
@@ -417,8 +417,8 @@ function createQueries(ctx) {
   }
 
   function borrowerDuplicate(params = {}) {
-    const name = String(params.name || "").trim().toLowerCase();
-    const phone = String(params.phone || "").trim();
+    const name = text(params.name, 200).toLowerCase();
+    const phone = text(params.phone, 60);
     if (!name || !phone) return null;
     const row = db
       .prepare(
@@ -485,7 +485,7 @@ function createQueries(ctx) {
   }
 
   function loanGet(params = {}) {
-    const id = params.id;
+    const id = idText(params.id);
     const today = todayUtc();
     const row = db
       .prepare(
@@ -533,7 +533,7 @@ function createQueries(ctx) {
   }
 
   function loansPicker(params = {}) {
-    const q = String(params.q || "").trim();
+    const q = text(params.q, 200);
     const mode = params.mode === "active" ? "active" : "open";
     const limit = Math.min(Math.max(num(params.limit) || 30, 1), 100);
     const bind = { limit, today: todayUtc() };
@@ -560,7 +560,7 @@ function createQueries(ctx) {
   }
 
   function loanPaymentContext(params = {}) {
-    const id = params.id;
+    const id = idText(params.id);
     const excludePaymentId = params.excludePaymentId || null;
     const loan = db.prepare("SELECT * FROM loans WHERE id = ?").get(id);
     if (!loan) return null;
@@ -600,7 +600,7 @@ function createQueries(ctx) {
 
   function paymentsPage(params = {}) {
     const { limit, page, offset } = pageArgs(params, 50);
-    const q = String(params.q || "").trim();
+    const q = text(params.q, 200);
     const select = `SELECT p.*, b.full_name AS "borrowerName", l.loan_number AS "loanNumber"
                       FROM payments p
                       LEFT JOIN borrowers b ON b.id = p.borrower_id
@@ -656,7 +656,7 @@ function createQueries(ctx) {
 
   function collateralPage(params = {}) {
     const { limit, page, offset } = pageArgs(params, 40);
-    const q = String(params.q || "").trim();
+    const q = text(params.q, 200);
     let where = "1 = 1";
     const bind = { limit, offset };
     if (q) {
@@ -695,7 +695,7 @@ function createQueries(ctx) {
 
   function expensesPage(params = {}) {
     const { limit, page, offset } = pageArgs(params, 50);
-    const q = String(params.q || "").trim();
+    const q = text(params.q, 200);
     let where = "1 = 1";
     const bind = { limit, offset };
     if (q) {
@@ -875,7 +875,7 @@ function createQueries(ctx) {
   }
 
   function fundingOpen(params = {}) {
-    const q = String(params.q || "").trim();
+    const q = text(params.q, 200);
     const excludeRepaymentId = params.excludeRepaymentId || null;
     const limit = Math.min(Math.max(num(params.limit) || 40, 1), 100);
     const bind = { limit, excludeId: excludeRepaymentId };
@@ -976,8 +976,8 @@ function createQueries(ctx) {
 
   function auditPage(params = {}) {
     const { limit, page, offset } = pageArgs(params, 60);
-    const q = String(params.q || "").trim();
-    const user = String(params.user || "All");
+    const q = text(params.q, 200);
+    const user = text(params.user, 200, "All");
     let where = "1 = 1";
     const bind = { limit, offset };
     if (q) {
@@ -1044,7 +1044,7 @@ function createQueries(ctx) {
   }
 
   function searchAll(params = {}) {
-    const q = String(params.q || "").trim();
+    const q = text(params.q, 200);
     if (!q) return { borrowers: [], loans: [], payments: [], collateral: [] };
     const like = `%${q}%`;
     const today = todayUtc();

@@ -5,45 +5,75 @@ const {
   nowIso,
   uid,
   num,
+  money,
+  int,
+  text,
+  note,
+  idText,
+  dateOnly,
+  optionalDate,
+  addDays,
   logAudit,
+  getSettings,
   setSetting,
   nextLoanNumber,
-  computeNextDueDate,
+  CURRENCY_CODES,
+  LANGUAGES,
   FREQ_DAYS,
+  FREQ_NAMES,
+  MAX_INSTALMENTS,
+  computeNextDueDate,
 } = require("./util");
 const { borrowerRow, loanRow, paymentRow, collateralRow, fundRow } = require("./rows");
 const { userRow } = require("./rows");
 
-const fmtMoney = (v) =>
-  `UGX ${Math.round(Number(v) || 0).toLocaleString("en-UG")}`;
-
 function createMutations(ctx, auth) {
   const { db } = ctx;
 
-  const getLoan = (id) => db.prepare("SELECT * FROM loans WHERE id = ?").get(id);
+  /** Audit messages are written in whatever currency the ledger is set to. */
+  const fmtMoney = (v) =>
+    `${getSettings(db).currency || "UGX"} ${Math.round(Number(v) || 0).toLocaleString("en-UG")}`;
+
+  /** Photos are small data URLs today, but cap the stored JSON so a malformed
+   *  IPC message can't balloon the encrypted database. */
+  function serializePhotos(photos) {
+    if (!Array.isArray(photos)) return "[]";
+    try {
+      const json = JSON.stringify(photos.slice(0, 10));
+      return json.length > 2 * 1024 * 1024 ? "[]" : json;
+    } catch (e) {
+      return "[]";
+    }
+  }
+
+  const getLoan = (id) =>
+    db.prepare("SELECT * FROM loans WHERE id = ?").get(idText(id));
   const getBorrower = (id) =>
-    db.prepare("SELECT * FROM borrowers WHERE id = ?").get(id);
+    db.prepare("SELECT * FROM borrowers WHERE id = ?").get(idText(id));
   const getFund = (id) =>
-    db.prepare("SELECT * FROM external_funds WHERE id = ?").get(id);
+    db.prepare("SELECT * FROM external_funds WHERE id = ?").get(idText(id));
 
   function insertLoan(input, extra = {}) {
-    const amount = num(input.amount);
-    const interestType = input.interestType || "Percent";
-    const interestValue = num(input.interestValue);
-    const paperworkFee = num(input.paperworkFee);
+    const amount = Math.max(0, money(input.amount));
+    const interestType = input.interestType === "Fixed" ? "Fixed" : "Percent";
+    const interestValue = money(input.interestValue);
+    const paperworkFee = Math.max(0, money(input.paperworkFee));
     const interestAmount =
       interestType === "Percent" ? (amount * interestValue) / 100 : interestValue;
-    const totalPayable = amount + interestAmount + paperworkFee;
-    const issueDate = input.issueDate || todayUtc();
-    const dueDate = input.dueDate || issueDate;
-    const repaymentMethod = input.repaymentMethod || "Full Payment";
+    const totalPayable = money(amount + interestAmount + paperworkFee);
+    const issueDate = dateOnly(input.issueDate, todayUtc());
+    const dueDate = dateOnly(input.dueDate, issueDate);
+    const repaymentMethod =
+      input.repaymentMethod === "Instalments" ? "Instalments" : "Full Payment";
     const inst =
       repaymentMethod === "Instalments" && input.instalments
         ? {
-            count: num(input.instalments.count),
-            frequency: input.instalments.frequency || "Monthly",
-            expectedAmount: num(input.instalments.expectedAmount),
-            firstPaymentDate: input.instalments.firstPaymentDate || issueDate,
+            count: int(input.instalments.count, 0, MAX_INSTALMENTS, 0),
+            frequency: FREQ_NAMES.includes(input.instalments.frequency)
+              ? input.instalments.frequency
+              : "Monthly",
+            expectedAmount: Math.max(0, money(input.instalments.expectedAmount)),
+            firstPaymentDate: dateOnly(input.instalments.firstPaymentDate, issueDate),
           }
         : null;
     const id = uid("loan");
@@ -68,7 +98,7 @@ function createMutations(ctx, auth) {
     ).run({
       id,
       loan_number: loanNumber,
-      borrower_id: input.borrowerId,
+      borrower_id: idText(input.borrowerId),
       amount,
       interest_type: interestType,
       interest_value: interestValue,
@@ -82,10 +112,10 @@ function createMutations(ctx, auth) {
       instalment_amount: inst ? inst.expectedAmount : null,
       instalment_first_date: inst ? inst.firstPaymentDate : null,
       auto_renewed: extra.auto ? 1 : 0,
-      issued_at: input.issuedAt || nowIso(),
+      issued_at: text(input.issuedAt, 40, nowIso()),
       is_historical: input.isHistorical ? 1 : 0,
-      next_due_date: nextDue,
-      renewed_from_id: extra.renewedFromId || null,
+      next_due_date: dateOnly(nextDue, issueDate),
+      renewed_from_id: idText(extra.renewedFromId) || null,
     });
 
     return {
@@ -117,30 +147,30 @@ function createMutations(ctx, auth) {
        )`
     ).run({
       id,
-      loan_id: input.loanId,
-      borrower_id: input.borrowerId,
-      description: input.description || "",
-      category: input.category || "Other",
-      brand: input.brand || "",
-      model: input.model || "",
-      serial: input.serial || "",
-      estimated_value: num(input.estimatedValue),
-      condition: input.condition || "",
-      date_received: input.dateReceived || todayUtc(),
-      storage_location: input.storageLocation || "",
-      status: input.status || "Held",
-      notes: input.notes || "",
-      photos: JSON.stringify(Array.isArray(input.photos) ? input.photos : []),
+      loan_id: idText(input.loanId),
+      borrower_id: idText(input.borrowerId),
+      description: text(input.description, 300),
+      category: text(input.category, 80, "Other"),
+      brand: text(input.brand, 120),
+      model: text(input.model, 120),
+      serial: text(input.serial, 120),
+      estimated_value: Math.max(0, money(input.estimatedValue)),
+      condition: text(input.condition, 120),
+      date_received: dateOnly(input.dateReceived, todayUtc()),
+      storage_location: text(input.storageLocation, 200),
+      status: text(input.status, 40, "Held"),
+      notes: note(input.notes),
+      photos: serializePhotos(input.photos),
     });
     return id;
   }
 
   function insertPaymentRecord(input) {
     const id = uid("pay");
-    const amount = num(input.amount);
+    const amount = Math.max(0, money(input.amount));
     const principal =
-      input.principalPaid != null ? num(input.principalPaid) : amount;
-    const interest = num(input.interestPaid);
+      input.principalPaid != null ? Math.max(0, money(input.principalPaid)) : amount;
+    const interest = Math.max(0, money(input.interestPaid));
     db.prepare(
       `INSERT INTO payments (
          id, loan_id, borrower_id, amount, principal_paid, interest_paid, date,
@@ -151,15 +181,15 @@ function createMutations(ctx, auth) {
        )`
     ).run({
       id,
-      loan_id: input.loanId,
-      borrower_id: input.borrowerId || null,
+      loan_id: idText(input.loanId),
+      borrower_id: idText(input.borrowerId) || null,
       amount,
       principal_paid: principal,
       interest_paid: interest,
-      date: input.date || todayUtc(),
-      method: input.method || "Cash",
-      reference: input.reference || "",
-      notes: input.notes || "",
+      date: dateOnly(input.date, todayUtc()),
+      method: text(input.method, 60, "Cash"),
+      reference: text(input.reference, 200),
+      notes: note(input.notes),
       created_at: nowIso(),
     });
     return id;
@@ -168,7 +198,8 @@ function createMutations(ctx, auth) {
   /* --------------------------------- borrowers -------------------------------- */
 
   function borrowerCreate({ actor, data = {} }) {
-    if (!String(data.fullName || "").trim()) {
+    const fullName = text(data.fullName, 200);
+    if (!fullName) {
       return { ok: false, error: "Full name is required." };
     }
     const id = uid("bor");
@@ -180,25 +211,25 @@ function createMutations(ctx, auth) {
                @occupation, @next_of_kin, @next_of_kin_phone, @notes, @date_registered)`
     ).run({
       id,
-      full_name: String(data.fullName).trim(),
-      phone: data.phone || "",
-      alt_phone: data.altPhone || "",
-      national_id: data.nationalId || "",
-      address: data.address || "",
-      occupation: data.occupation || "",
-      next_of_kin: data.nextOfKin || "",
-      next_of_kin_phone: data.nextOfKinPhone || "",
-      notes: data.notes || "",
-      date_registered: data.dateRegistered || todayUtc(),
+      full_name: fullName,
+      phone: text(data.phone, 60),
+      alt_phone: text(data.altPhone, 60),
+      national_id: text(data.nationalId, 60),
+      address: text(data.address, 300),
+      occupation: text(data.occupation, 120),
+      next_of_kin: text(data.nextOfKin, 200),
+      next_of_kin_phone: text(data.nextOfKinPhone, 60),
+      notes: note(data.notes),
+      date_registered: dateOnly(data.dateRegistered, todayUtc()),
     });
-    logAudit(db, actor, `Registered new borrower "${String(data.fullName).trim()}"`);
+    logAudit(db, actor, `Registered new borrower "${fullName}"`);
     return { ok: true, borrower: borrowerRow(getBorrower(id)) };
   }
 
   function borrowerUpdate({ actor, id, data = {} }) {
     const existing = getBorrower(id);
     if (!existing) return { ok: false, error: "Borrower not found." };
-    const fullName = String(data.fullName || existing.full_name).trim();
+    const fullName = text(data.fullName, 200, existing.full_name);
     db.prepare(
       `UPDATE borrowers SET
          full_name = @full_name, phone = @phone, alt_phone = @alt_phone,
@@ -207,17 +238,31 @@ function createMutations(ctx, auth) {
          notes = @notes
        WHERE id = @id`
     ).run({
-      id,
+      id: existing.id,
       full_name: fullName,
-      phone: data.phone != null ? data.phone : existing.phone,
-      alt_phone: data.altPhone != null ? data.altPhone : existing.alt_phone,
-      national_id: data.nationalId != null ? data.nationalId : existing.national_id,
-      address: data.address != null ? data.address : existing.address,
-      occupation: data.occupation != null ? data.occupation : existing.occupation,
-      next_of_kin: data.nextOfKin != null ? data.nextOfKin : existing.next_of_kin,
-      next_of_kin_phone:
+      phone: text(data.phone != null ? data.phone : existing.phone, 60),
+      alt_phone: text(
+        data.altPhone != null ? data.altPhone : existing.alt_phone,
+        60
+      ),
+      national_id: text(
+        data.nationalId != null ? data.nationalId : existing.national_id,
+        60
+      ),
+      address: text(data.address != null ? data.address : existing.address, 300),
+      occupation: text(
+        data.occupation != null ? data.occupation : existing.occupation,
+        120
+      ),
+      next_of_kin: text(
+        data.nextOfKin != null ? data.nextOfKin : existing.next_of_kin,
+        200
+      ),
+      next_of_kin_phone: text(
         data.nextOfKinPhone != null ? data.nextOfKinPhone : existing.next_of_kin_phone,
-      notes: data.notes != null ? data.notes : existing.notes,
+        60
+      ),
+      notes: note(data.notes != null ? data.notes : existing.notes),
     });
     logAudit(db, actor, `Edited borrower profile "${fullName}"`);
     return { ok: true, borrower: borrowerRow(getBorrower(id)) };
@@ -226,8 +271,8 @@ function createMutations(ctx, auth) {
   function borrowerDelete({ actor, id, entityLabel }) {
     const row = getBorrower(id);
     if (!row) return { ok: false, error: "Borrower not found." };
-    db.prepare("DELETE FROM borrowers WHERE id = ?").run(id);
-    logAudit(db, actor, `Deleted ${entityLabel || `borrower "${row.full_name}"`}`);
+    db.prepare("DELETE FROM borrowers WHERE id = ?").run(row.id);
+    logAudit(db, actor, `Deleted ${text(entityLabel, 300, `borrower "${row.full_name}"`)}`);
     return { ok: true };
   }
 
@@ -285,40 +330,65 @@ function createMutations(ctx, auth) {
   function loanUpdate({ actor, id, data = {} }) {
     const old = getLoan(id);
     if (!old) return { ok: false, error: "Loan not found." };
-    const amount = num(data.amount != null ? data.amount : old.amount);
+    const amount = Math.max(
+      0,
+      money(data.amount != null ? data.amount : old.amount)
+    );
     if (amount <= 0) return { ok: false, error: "Enter a loan amount." };
-    const interestType = data.interestType || old.interest_type || "Percent";
-    const interestValue = num(
+    const interestType =
+      data.interestType === "Fixed" || data.interestType === "Percent"
+        ? data.interestType
+        : old.interest_type === "Fixed"
+        ? "Fixed"
+        : "Percent";
+    const interestValue = money(
       data.interestValue != null ? data.interestValue : old.interest_value
     );
-    const paperworkFee = num(
-      data.paperworkFee != null ? data.paperworkFee : old.paperwork_fee
+    const paperworkFee = Math.max(
+      0,
+      money(data.paperworkFee != null ? data.paperworkFee : old.paperwork_fee)
     );
     const interestAmount =
       interestType === "Percent" ? (amount * interestValue) / 100 : interestValue;
-    const totalPayable = amount + interestAmount + paperworkFee;
+    const totalPayable = money(amount + interestAmount + paperworkFee);
     if (totalPayable < num(old.paid_amount)) {
       return {
         ok: false,
         error: `The new total (${fmtMoney(totalPayable)}) can't be less than what's already been paid (${fmtMoney(old.paid_amount)}).`,
       };
     }
-    const repaymentMethod = data.repaymentMethod || old.repayment_method;
+    const issueDate = dateOnly(data.issueDate, old.issue_date);
+    const dueDate = dateOnly(data.dueDate, old.due_date || issueDate);
+    const repaymentMethod =
+      data.repaymentMethod === "Instalments" ||
+      (data.repaymentMethod == null && old.repayment_method === "Instalments")
+        ? "Instalments"
+        : "Full Payment";
+    const source = data.instalments
+      ? data.instalments
+      : old.instalment_first_date
+      ? {
+          count: old.instalment_count,
+          frequency: old.instalment_frequency,
+          expectedAmount: old.instalment_amount,
+          firstPaymentDate: old.instalment_first_date,
+        }
+      : null;
     const inst =
-      repaymentMethod === "Instalments" && data.instalments
-        ? data.instalments
-        : repaymentMethod === "Instalments" && old.instalment_first_date
+      repaymentMethod === "Instalments" && source
         ? {
-            count: old.instalment_count,
-            frequency: old.instalment_frequency,
-            expectedAmount: old.instalment_amount,
-            firstPaymentDate: old.instalment_first_date,
+            count: int(source.count, 0, MAX_INSTALMENTS, 0),
+            frequency: FREQ_NAMES.includes(source.frequency)
+              ? source.frequency
+              : "Monthly",
+            expectedAmount: Math.max(0, money(source.expectedAmount)),
+            firstPaymentDate: dateOnly(source.firstPaymentDate, issueDate),
           }
         : null;
 
     const loanObj = {
       repaymentMethod,
-      dueDate: data.dueDate || old.due_date,
+      dueDate,
       instalments: inst,
       paymentCount: old.payment_count,
     };
@@ -337,35 +407,36 @@ function createMutations(ctx, auth) {
          next_due_date = @next_due_date
        WHERE id = @id`
     ).run({
-      id,
+      id: old.id,
       amount,
       interest_type: interestType,
       interest_value: interestValue,
       paperwork_fee: paperworkFee,
       total_payable: totalPayable,
-      issue_date: data.issueDate || old.issue_date,
-      due_date: data.dueDate || old.due_date,
+      issue_date: issueDate,
+      due_date: dueDate,
       repayment_method: repaymentMethod,
-      instalment_count: inst ? num(inst.count) : null,
-      instalment_frequency: inst ? inst.frequency || "Monthly" : null,
-      instalment_amount: inst ? num(inst.expectedAmount) : null,
-      instalment_first_date: inst ? inst.firstPaymentDate || null : null,
+      instalment_count: inst ? inst.count : null,
+      instalment_frequency: inst ? inst.frequency : null,
+      instalment_amount: inst ? inst.expectedAmount : null,
+      instalment_first_date: inst ? inst.firstPaymentDate : null,
       next_due_date: nextDue,
     });
     logAudit(db, actor, `Edited loan ${old.loan_number}`);
-    return { ok: true, loan: loanRow(getLoan(id)) };
+    return { ok: true, loan: loanRow(getLoan(old.id)) };
   }
 
   function loanVoid({ actor, id, reason }) {
     const old = getLoan(id);
     if (!old) return { ok: false, error: "Loan not found." };
-    if (!String(reason || "").trim()) {
+    const cleanReason = text(reason, 1000);
+    if (!cleanReason) {
       return { ok: false, error: "Reason for voiding this loan is required." };
     }
     db.prepare(
       "UPDATE loans SET voided = 1, void_reason = ?, voided_at = ? WHERE id = ?"
-    ).run(String(reason).trim(), todayUtc(), id);
-    logAudit(db, actor, `Voided loan ${old.loan_number} (reason: ${String(reason).trim()})`);
+    ).run(cleanReason, todayUtc(), old.id);
+    logAudit(db, actor, `Voided loan ${old.loan_number} (reason: ${cleanReason})`);
     return { ok: true };
   }
 
@@ -405,27 +476,38 @@ function createMutations(ctx, auth) {
       return { ok: false, error: "This loan can't be renewed." };
     }
     const outstanding = Math.max(0, num(old.total_payable) - num(old.paid_amount));
-    const principal =
-      num(opts.newPrincipal) > 0 ? num(opts.newPrincipal) : outstanding;
+    const principal = Math.max(
+      0,
+      money(opts.newPrincipal) > 0 ? money(opts.newPrincipal) : outstanding
+    );
+    if (principal <= 0) {
+      return { ok: false, error: "This loan has nothing left to renew." };
+    }
+    const issueDate = dateOnly(old.issue_date, todayUtc());
+    const dueDate = dateOnly(old.due_date, issueDate);
     const term = Math.max(
-      Math.round(
-        (new Date(old.due_date || todayUtc()) - new Date(old.issue_date || todayUtc())) /
-          86400000
+      int(
+        Math.round(
+          (new Date(`${dueDate}T00:00:00Z`) -
+            new Date(`${issueDate}T00:00:00Z`)) /
+            86400000
+        ),
+        1,
+        3650,
+        30
       ),
       7
     );
-    const due = new Date();
-    due.setDate(due.getDate() + term);
-    let dueDate = opts.newDueDate || due.toISOString().slice(0, 10);
+    const nextDueDate = dateOnly(opts.newDueDate, addDays(todayUtc(), term));
     const created = insertLoan(
       {
         borrowerId: old.borrower_id,
         amount: principal,
-        interestType: opts.interestType || "Percent",
+        interestType: opts.interestType === "Fixed" ? "Fixed" : "Percent",
         interestValue:
           opts.interestValue != null ? opts.interestValue : 20,
         paperworkFee: opts.paperworkFee || 0,
-        dueDate,
+        dueDate: nextDueDate,
         issueDate: todayUtc(),
         repaymentMethod: "Full Payment",
       },
@@ -457,8 +539,8 @@ function createMutations(ctx, auth) {
   function loanDelete({ actor, id, entityLabel }) {
     const row = getLoan(id);
     if (!row) return { ok: false, error: "Loan not found." };
-    db.prepare("DELETE FROM loans WHERE id = ?").run(id);
-    logAudit(db, actor, `Deleted ${entityLabel || `loan ${row.loan_number}`}`);
+    db.prepare("DELETE FROM loans WHERE id = ?").run(row.id);
+    logAudit(db, actor, `Deleted ${text(entityLabel, 300, `loan ${row.loan_number}`)}`);
     return { ok: true };
   }
 
@@ -468,9 +550,12 @@ function createMutations(ctx, auth) {
     const loan = getLoan(data.loanId);
     if (!loan) return { ok: false, error: "Select a loan to record a payment against." };
     if (loan.voided) return { ok: false, error: "This loan is voided." };
-    const principal = num(data.principalPaid);
-    const interest = num(data.interestPaid);
-    const amount = data.amount != null ? num(data.amount) : principal + interest;
+    const principal = Math.max(0, money(data.principalPaid));
+    const interest = Math.max(0, money(data.interestPaid));
+    const amount = Math.max(
+      0,
+      money(data.amount != null ? data.amount : principal + interest)
+    );
     if (amount <= 0) {
       return { ok: false, error: "Enter an amount towards principal, interest, or both." };
     }
@@ -503,45 +588,67 @@ function createMutations(ctx, auth) {
   }
 
   function paymentUpdate({ actor, id, data = {} }) {
-    const old = db.prepare("SELECT * FROM payments WHERE id = ?").get(id);
+    const old = db
+      .prepare("SELECT * FROM payments WHERE id = ?")
+      .get(idText(id));
     if (!old) return { ok: false, error: "Payment not found." };
     const loan = getLoan(old.loan_id);
-    const principal = num(
-      data.principalPaid != null ? data.principalPaid : old.principal_paid
+    const principal = Math.max(
+      0,
+      money(
+        data.principalPaid != null ? data.principalPaid : old.principal_paid
+      )
     );
-    const interest = num(
-      data.interestPaid != null ? data.interestPaid : old.interest_paid
+    const interest = Math.max(
+      0,
+      money(data.interestPaid != null ? data.interestPaid : old.interest_paid)
     );
-    const amount =
-      data.amount != null ? num(data.amount) : principal + interest;
+    const amount = Math.max(
+      0,
+      money(data.amount != null ? data.amount : principal + interest)
+    );
     if (amount <= 0) return { ok: false, error: "Enter a payment amount." };
     db.prepare(
       `UPDATE payments SET amount = @amount, principal_paid = @principal_paid,
          interest_paid = @interest_paid, date = @date, method = @method,
          reference = @reference, notes = @notes WHERE id = @id`
     ).run({
-      id,
+      id: old.id,
       amount,
       principal_paid: principal,
       interest_paid: interest,
-      date: data.date || old.date,
-      method: data.method || old.method,
-      reference: data.reference != null ? data.reference : old.reference,
-      notes: data.notes != null ? data.notes : old.notes,
+      date: dateOnly(data.date, old.date),
+      method: text(data.method, 60, old.method || "Cash"),
+      reference: text(
+        data.reference != null ? data.reference : old.reference,
+        200
+      ),
+      notes: note(data.notes != null ? data.notes : old.notes),
     });
     logAudit(
       db,
       actor,
       `Edited payment of ${fmtMoney(amount)} on loan ${loan ? loan.loan_number : "unknown"}`
     );
-    return { ok: true, payment: paymentRow(db.prepare("SELECT * FROM payments WHERE id = ?").get(id)) };
+    return {
+      ok: true,
+      payment: paymentRow(
+        db.prepare("SELECT * FROM payments WHERE id = ?").get(old.id)
+      ),
+    };
   }
 
   function paymentDelete({ actor, id, entityLabel }) {
-    const old = db.prepare("SELECT * FROM payments WHERE id = ?").get(id);
+    const old = db
+      .prepare("SELECT * FROM payments WHERE id = ?")
+      .get(idText(id));
     if (!old) return { ok: false, error: "Payment not found." };
-    db.prepare("DELETE FROM payments WHERE id = ?").run(id);
-    logAudit(db, actor, `Deleted ${entityLabel || `payment of ${fmtMoney(old.amount)}`}`);
+    db.prepare("DELETE FROM payments WHERE id = ?").run(old.id);
+    logAudit(
+      db,
+      actor,
+      `Deleted ${text(entityLabel, 300, `payment of ${fmtMoney(old.amount)}`)}`
+    );
     return { ok: true };
   }
 
@@ -550,24 +657,41 @@ function createMutations(ctx, auth) {
   function collateralCreate({ actor, data = {} }) {
     const loan = getLoan(data.loanId);
     if (!loan) return { ok: false, error: "Select the loan this collateral belongs to." };
-    if (!String(data.description || "").trim()) {
+    const description = text(data.description, 300);
+    if (!description) {
       return { ok: false, error: "Describe the item." };
     }
     const id = insertCollateralRecord({
       ...data,
+      description,
       loanId: loan.id,
       borrowerId: loan.borrower_id,
       status: "Held",
     });
-    logAudit(db, actor, `Added collateral "${String(data.description).trim()}" on loan ${loan.loan_number}`);
-    return { ok: true, collateral: collateralRow(db.prepare("SELECT * FROM collateral WHERE id = ?").get(id)) };
+    logAudit(
+      db,
+      actor,
+      `Added collateral "${description}" on loan ${loan.loan_number}`
+    );
+    return {
+      ok: true,
+      collateral: collateralRow(
+        db.prepare("SELECT * FROM collateral WHERE id = ?").get(id)
+      ),
+    };
   }
 
   function collateralUpdate({ actor, id, data = {} }) {
-    const old = db.prepare("SELECT * FROM collateral WHERE id = ?").get(id);
+    const old = db
+      .prepare("SELECT * FROM collateral WHERE id = ?")
+      .get(idText(id));
     if (!old) return { ok: false, error: "Collateral record not found." };
     const loan = data.loanId ? getLoan(data.loanId) : getLoan(old.loan_id);
     if (!loan) return { ok: false, error: "Select the loan this collateral belongs to." };
+    const description = text(
+      data.description != null ? data.description : old.description,
+      300
+    );
     db.prepare(
       `UPDATE collateral SET
          loan_id = @loan_id, borrower_id = @borrower_id, description = @description,
@@ -577,39 +701,58 @@ function createMutations(ctx, auth) {
          notes = @notes, status = @status
        WHERE id = @id`
     ).run({
-      id,
+      id: old.id,
       loan_id: loan.id,
       borrower_id: loan.borrower_id,
-      description: data.description != null ? data.description : old.description,
-      category: data.category != null ? data.category : old.category,
-      brand: data.brand != null ? data.brand : old.brand,
-      model: data.model != null ? data.model : old.model,
-      serial: data.serial != null ? data.serial : old.serial,
-      estimated_value:
-        data.estimatedValue != null ? num(data.estimatedValue) : old.estimated_value,
-      condition: data.condition != null ? data.condition : old.condition,
-      date_received: data.dateReceived || old.date_received,
-      storage_location:
-        data.storageLocation != null ? data.storageLocation : old.storage_location,
-      notes: data.notes != null ? data.notes : old.notes,
-      status: data.status || old.status,
+      description,
+      category: text(
+        data.category != null ? data.category : old.category,
+        80,
+        "Other"
+      ),
+      brand: text(data.brand != null ? data.brand : old.brand, 120),
+      model: text(data.model != null ? data.model : old.model, 120),
+      serial: text(data.serial != null ? data.serial : old.serial, 120),
+      estimated_value: Math.max(
+        0,
+        money(
+          data.estimatedValue != null
+            ? data.estimatedValue
+            : old.estimated_value
+        )
+      ),
+      condition: text(
+        data.condition != null ? data.condition : old.condition,
+        120
+      ),
+      date_received: dateOnly(data.dateReceived, old.date_received || todayUtc()),
+      storage_location: text(
+        data.storageLocation != null
+          ? data.storageLocation
+          : old.storage_location,
+        200
+      ),
+      notes: note(data.notes != null ? data.notes : old.notes),
+      status: text(data.status, 40, old.status || "Held"),
     });
-    logAudit(
-      db,
-      actor,
-      `Edited collateral "${data.description || old.description}"`
-    );
+    logAudit(db, actor, `Edited collateral "${description || old.description}"`);
     return {
       ok: true,
-      collateral: collateralRow(db.prepare("SELECT * FROM collateral WHERE id = ?").get(id)),
+      collateral: collateralRow(
+        db.prepare("SELECT * FROM collateral WHERE id = ?").get(old.id)
+      ),
     };
   }
 
   function collateralRelease({ actor, id }) {
-    const old = db.prepare("SELECT * FROM collateral WHERE id = ?").get(id);
+    const old = db
+      .prepare("SELECT * FROM collateral WHERE id = ?")
+      .get(idText(id));
     if (!old) return { ok: false, error: "Collateral record not found." };
     const loan = getLoan(old.loan_id);
-    db.prepare("UPDATE collateral SET status = 'Released' WHERE id = ?").run(id);
+    db.prepare("UPDATE collateral SET status = 'Released' WHERE id = ?").run(
+      old.id
+    );
     logAudit(
       db,
       actor,
@@ -621,76 +764,105 @@ function createMutations(ctx, auth) {
   }
 
   function collateralDelete({ actor, id, entityLabel }) {
-    const old = db.prepare("SELECT * FROM collateral WHERE id = ?").get(id);
+    const old = db
+      .prepare("SELECT * FROM collateral WHERE id = ?")
+      .get(idText(id));
     if (!old) return { ok: false, error: "Collateral record not found." };
-    db.prepare("DELETE FROM collateral WHERE id = ?").run(id);
-    logAudit(db, actor, `Deleted ${entityLabel || `collateral "${old.description}"`}`);
+    db.prepare("DELETE FROM collateral WHERE id = ?").run(old.id);
+    logAudit(
+      db,
+      actor,
+      `Deleted ${text(entityLabel, 300, `collateral "${old.description}"`)}`
+    );
     return { ok: true };
   }
 
   /* ---------------------------------- expenses -------------------------------- */
 
   function expenseCreate({ actor, data = {} }) {
-    if (!String(data.description || "").trim()) {
+    const description = text(data.description, 300);
+    if (!description) {
       return { ok: false, error: "Describe the expense." };
     }
-    if (num(data.amount) <= 0) return { ok: false, error: "Enter an amount." };
+    const amount = money(data.amount);
+    if (amount <= 0) return { ok: false, error: "Enter an amount." };
     const id = uid("exp");
     db.prepare(
       `INSERT INTO expenses (id, description, category, amount, date, method, notes, voided)
        VALUES (?, ?, ?, ?, ?, ?, ?, 0)`
     ).run(
       id,
-      String(data.description).trim(),
-      data.category || "Other",
-      num(data.amount),
-      data.date || todayUtc(),
-      data.method || "Cash",
-      data.notes || ""
+      description,
+      text(data.category, 80, "Other"),
+      amount,
+      dateOnly(data.date, todayUtc()),
+      text(data.method, 60, "Cash"),
+      note(data.notes)
     );
     logAudit(
       db,
       actor,
-      `Recorded expense "${String(data.description).trim()}" (${fmtMoney(data.amount)})`
+      `Recorded expense "${description}" (${fmtMoney(amount)})`
     );
     return { ok: true, id };
   }
 
   function expenseUpdate({ actor, id, data = {} }) {
-    const old = db.prepare("SELECT * FROM expenses WHERE id = ?").get(id);
+    const old = db
+      .prepare("SELECT * FROM expenses WHERE id = ?")
+      .get(idText(id));
     if (!old) return { ok: false, error: "Expense not found." };
+    const amount = money(data.amount != null ? data.amount : old.amount);
+    if (amount <= 0) return { ok: false, error: "Enter an amount." };
+    const description = text(
+      data.description != null ? data.description : old.description,
+      300
+    );
     db.prepare(
       `UPDATE expenses SET description = @description, category = @category,
          amount = @amount, date = @date, method = @method, notes = @notes
        WHERE id = @id`
     ).run({
-      id,
-      description: data.description != null ? data.description : old.description,
-      category: data.category != null ? data.category : old.category,
-      amount: data.amount != null ? num(data.amount) : old.amount,
-      date: data.date || old.date,
-      method: data.method || old.method,
-      notes: data.notes != null ? data.notes : old.notes,
+      id: old.id,
+      description,
+      category: text(
+        data.category != null ? data.category : old.category,
+        80,
+        "Other"
+      ),
+      amount,
+      date: dateOnly(data.date, old.date || todayUtc()),
+      method: text(data.method, 60, old.method || "Cash"),
+      notes: note(data.notes != null ? data.notes : old.notes),
     });
-    logAudit(db, actor, `Edited expense "${data.description || old.description}"`);
+    logAudit(db, actor, `Edited expense "${description || old.description}"`);
     return { ok: true };
   }
 
   function expenseDelete({ actor, id, entityLabel }) {
-    const old = db.prepare("SELECT * FROM expenses WHERE id = ?").get(id);
+    const old = db
+      .prepare("SELECT * FROM expenses WHERE id = ?")
+      .get(idText(id));
     if (!old) return { ok: false, error: "Expense not found." };
-    db.prepare("DELETE FROM expenses WHERE id = ?").run(id);
-    logAudit(db, actor, `Deleted ${entityLabel || `expense "${old.description}"`}`);
+    db.prepare("DELETE FROM expenses WHERE id = ?").run(old.id);
+    logAudit(
+      db,
+      actor,
+      `Deleted ${text(entityLabel, 300, `expense "${old.description}"`)}`
+    );
     return { ok: true };
   }
 
   /* ------------------------------- external funding ---------------------------- */
 
   function fundCreate({ actor, data = {} }) {
-    if (!String(data.source || "").trim()) {
+    const source = text(data.source, 200);
+    if (!source) {
       return { ok: false, error: "Enter the lender or bank name." };
     }
-    if (num(data.amount) <= 0) return { ok: false, error: "Enter the amount received." };
+    const amount = money(data.amount);
+    if (amount <= 0) return { ok: false, error: "Enter the amount received." };
+    const type = text(data.type, 80, "External Loan");
     const id = uid("fund");
     db.prepare(
       `INSERT INTO external_funds
@@ -698,17 +870,17 @@ function createMutations(ctx, auth) {
        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)`
     ).run(
       id,
-      data.type || "External Loan",
-      String(data.source).trim(),
-      num(data.amount),
-      data.dateReceived || todayUtc(),
-      data.expectedRepaymentDate || "",
-      data.notes || ""
+      type,
+      source,
+      amount,
+      dateOnly(data.dateReceived, todayUtc()),
+      optionalDate(data.expectedRepaymentDate),
+      note(data.notes)
     );
     logAudit(
       db,
       actor,
-      `Recorded ${fmtMoney(data.amount)} received from ${String(data.source).trim()} (${data.type || "External Loan"})`
+      `Recorded ${fmtMoney(amount)} received from ${source} (${type})`
     );
     return { ok: true, id };
   }
@@ -716,20 +888,26 @@ function createMutations(ctx, auth) {
   function fundUpdate({ actor, id, data = {} }) {
     const old = getFund(id);
     if (!old) return { ok: false, error: "Funding record not found." };
+    const amount = money(data.amount != null ? data.amount : old.amount);
+    if (amount <= 0) return { ok: false, error: "Enter the amount received." };
     db.prepare(
       `UPDATE external_funds SET type = @type, source = @source, amount = @amount,
          date_received = @date_received, expected_repayment_date = @expected,
          notes = @notes WHERE id = @id`
     ).run({
-      id,
-      type: data.type || old.type,
-      source: data.source != null ? String(data.source).trim() : old.source,
-      amount: data.amount != null ? num(data.amount) : old.amount,
-      date_received: data.dateReceived || old.date_received,
-      expected: data.expectedRepaymentDate != null
-        ? data.expectedRepaymentDate
-        : old.expected_repayment_date,
-      notes: data.notes != null ? data.notes : old.notes,
+      id: old.id,
+      type: text(data.type, 80, old.type || "External Loan"),
+      source: text(data.source != null ? data.source : old.source, 200),
+      amount,
+      date_received: dateOnly(
+        data.dateReceived,
+        old.date_received || todayUtc()
+      ),
+      expected:
+        data.expectedRepaymentDate != null
+          ? optionalDate(data.expectedRepaymentDate)
+          : optionalDate(old.expected_repayment_date),
+      notes: note(data.notes != null ? data.notes : old.notes),
     });
     logAudit(db, actor, `Edited funding record from ${old.source} (${old.type})`);
     return { ok: true };
@@ -738,15 +916,20 @@ function createMutations(ctx, auth) {
   function fundDelete({ actor, id, entityLabel }) {
     const old = getFund(id);
     if (!old) return { ok: false, error: "Funding record not found." };
-    db.prepare("DELETE FROM external_funds WHERE id = ?").run(id);
-    logAudit(db, actor, `Deleted ${entityLabel || `funding record from "${old.source}"`}`);
+    db.prepare("DELETE FROM external_funds WHERE id = ?").run(old.id);
+    logAudit(
+      db,
+      actor,
+      `Deleted ${text(entityLabel, 300, `funding record from "${old.source}"`)}`
+    );
     return { ok: true };
   }
 
   function fundRepaymentCreate({ actor, data = {} }) {
     const fund = getFund(data.fundId);
     if (!fund) return { ok: false, error: "Select which loan or bank fund this repayment is for." };
-    if (num(data.amount) <= 0) return { ok: false, error: "Enter the repayment amount." };
+    const amount = money(data.amount);
+    if (amount <= 0) return { ok: false, error: "Enter the repayment amount." };
     const id = uid("fundpay");
     db.prepare(
       `INSERT INTO fund_repayments (id, fund_id, amount, date, method, notes, voided)
@@ -754,33 +937,37 @@ function createMutations(ctx, auth) {
     ).run(
       id,
       fund.id,
-      num(data.amount),
-      data.date || todayUtc(),
-      data.method || "Cash",
-      data.notes || ""
+      amount,
+      dateOnly(data.date, todayUtc()),
+      text(data.method, 60, "Cash"),
+      note(data.notes)
     );
     logAudit(
       db,
       actor,
-      `Recorded repayment of ${fmtMoney(data.amount)} to ${fund.source} (${fund.type})`
+      `Recorded repayment of ${fmtMoney(amount)} to ${fund.source} (${fund.type})`
     );
     return { ok: true, id };
   }
 
   function fundRepaymentUpdate({ actor, id, data = {} }) {
-    const old = db.prepare("SELECT * FROM fund_repayments WHERE id = ?").get(id);
+    const old = db
+      .prepare("SELECT * FROM fund_repayments WHERE id = ?")
+      .get(idText(id));
     if (!old) return { ok: false, error: "Repayment not found." };
     const fund = getFund(data.fundId || old.fund_id);
+    const amount = money(data.amount != null ? data.amount : old.amount);
+    if (amount <= 0) return { ok: false, error: "Enter the repayment amount." };
     db.prepare(
       `UPDATE fund_repayments SET fund_id = @fund_id, amount = @amount, date = @date,
          method = @method, notes = @notes WHERE id = @id`
     ).run({
-      id,
+      id: old.id,
       fund_id: fund ? fund.id : old.fund_id,
-      amount: data.amount != null ? num(data.amount) : old.amount,
-      date: data.date || old.date,
-      method: data.method || old.method,
-      notes: data.notes != null ? data.notes : old.notes,
+      amount,
+      date: dateOnly(data.date, old.date || todayUtc()),
+      method: text(data.method, 60, old.method || "Cash"),
+      notes: note(data.notes != null ? data.notes : old.notes),
     });
     logAudit(
       db,
@@ -791,16 +978,18 @@ function createMutations(ctx, auth) {
   }
 
   function fundRepaymentDelete({ actor, id, entityLabel }) {
-    const old = db.prepare(
-      `SELECT r.*, f.source, f.type FROM fund_repayments r
+    const old = db
+      .prepare(
+        `SELECT r.*, f.source, f.type FROM fund_repayments r
          LEFT JOIN external_funds f ON f.id = r.fund_id WHERE r.id = ?`
-    ).get(id);
+      )
+      .get(idText(id));
     if (!old) return { ok: false, error: "Repayment not found." };
-    db.prepare("DELETE FROM fund_repayments WHERE id = ?").run(id);
+    db.prepare("DELETE FROM fund_repayments WHERE id = ?").run(old.id);
     logAudit(
       db,
       actor,
-      `Deleted ${entityLabel || `repayment of ${fmtMoney(old.amount)}`}`
+      `Deleted ${text(entityLabel, 300, `repayment of ${fmtMoney(old.amount)}`)}`
     );
     return { ok: true };
   }
@@ -808,34 +997,99 @@ function createMutations(ctx, auth) {
   /* ----------------------------------- users ---------------------------------- */
 
   function userDelete({ actor, id, entityLabel }) {
-    const row = db.prepare("SELECT * FROM users WHERE id = ?").get(id);
+    const row = db
+      .prepare("SELECT * FROM users WHERE id = ?")
+      .get(idText(id));
     if (!row) return { ok: false, error: "User not found." };
-    if (row.username === "admin") {
+    if (String(row.username).toLowerCase() === "admin") {
       return { ok: false, error: "The default administrator account can't be deleted." };
     }
-    db.prepare("DELETE FROM users WHERE id = ?").run(id);
-    logAudit(db, actor, `Deleted ${entityLabel || `user account "${row.username}"`}`);
+    if (row.active && row.role === "Administrator") {
+      const otherAdmins = db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM users
+            WHERE active = 1 AND role = 'Administrator' AND id <> ?`
+        )
+        .get(row.id).c;
+      if (otherAdmins === 0) {
+        return {
+          ok: false,
+          error: "At least one active administrator account must remain.",
+        };
+      }
+    }
+    db.prepare("DELETE FROM users WHERE id = ?").run(row.id);
+    logAudit(
+      db,
+      actor,
+      `Deleted ${text(entityLabel, 300, `user account "${row.username}"`)}`
+    );
     return { ok: true };
   }
 
   /* --------------------------------- settings --------------------------------- */
 
   function settingsUpdate({ actor, settings = {} }) {
+    let currencyChanged = null;
+    if (settings.currency != null) {
+      const code = String(settings.currency).toUpperCase();
+      if (!CURRENCY_CODES.includes(code)) {
+        return { ok: false, error: "That currency isn't supported." };
+      }
+      currencyChanged = code;
+    }
+    let language = null;
+    if (settings.language != null) {
+      language = String(settings.language);
+      if (!LANGUAGES.includes(language)) {
+        return { ok: false, error: "That language isn't supported." };
+      }
+    }
     if (settings.businessName != null) {
-      setSetting(db, "businessName", String(settings.businessName).trim() || "My Lending Business");
+      setSetting(
+        db,
+        "businessName",
+        text(settings.businessName, 200, "My Lending Business")
+      );
     }
     if (settings.startingCashBalance != null) {
-      setSetting(db, "startingCashBalance", String(num(settings.startingCashBalance)));
+      setSetting(db, "startingCashBalance", String(money(settings.startingCashBalance)));
     }
-    if (settings.language != null) setSetting(db, "language", String(settings.language));
-    logAudit(db, actor, "Updated business settings");
+    if (language) setSetting(db, "language", language);
+    if (currencyChanged) setSetting(db, "currency", currencyChanged);
+    logAudit(
+      db,
+      actor,
+      currencyChanged ? `Changed display currency to ${currencyChanged}` : "Updated business settings"
+    );
     return { ok: true };
   }
 
   /* -------------------------------- approvals --------------------------------- */
 
+  const DELETABLE_TYPES = {
+    borrower: "borrowers",
+    loan: "loans",
+    payment: "payments",
+    collateral: "collateral",
+    expense: "expenses",
+    fund: "external_funds",
+    fundRepayment: "fund_repayments",
+    user: "users",
+  };
+
   function deletionRequest({ actor, requestedBy, requestedByName, entityType, entityId, entityLabel }) {
+    const table = DELETABLE_TYPES[entityType];
+    if (!table) return { ok: false, error: "Unknown record type." };
+    const cleanId = idText(entityId);
+    if (!cleanId) return { ok: false, error: "Missing record to delete." };
+    const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(cleanId);
+    if (!row) return { ok: false, error: "That record no longer exists." };
+    if (entityType === "user" && String(row.username).toLowerCase() === "admin") {
+      return { ok: false, error: "The default administrator account can't be deleted." };
+    }
     const id = uid("delreq");
+    const label = text(entityLabel, 300, "record");
     db.prepare(
       `INSERT INTO deletion_requests
         (id, entity_type, entity_id, entity_label, requested_by, requested_by_name,
@@ -844,59 +1098,43 @@ function createMutations(ctx, auth) {
     ).run(
       id,
       entityType,
-      entityId,
-      entityLabel,
-      requestedBy || actor,
-      requestedByName || actor,
+      cleanId,
+      label,
+      text(requestedBy || actor, 120),
+      text(requestedByName || actor, 200),
       nowIso()
     );
-    logAudit(db, actor, `Requested deletion approval for ${entityLabel}`);
+    logAudit(db, actor, `Requested deletion approval for ${label}`);
     return { ok: true, id };
   }
 
   function executeDeletion(entityType, entityId) {
-    switch (entityType) {
-      case "borrower":
-        db.prepare("DELETE FROM borrowers WHERE id = ?").run(entityId);
-        break;
-      case "loan":
-        db.prepare("DELETE FROM loans WHERE id = ?").run(entityId);
-        break;
-      case "payment":
-        db.prepare("DELETE FROM payments WHERE id = ?").run(entityId);
-        break;
-      case "collateral":
-        db.prepare("DELETE FROM collateral WHERE id = ?").run(entityId);
-        break;
-      case "expense":
-        db.prepare("DELETE FROM expenses WHERE id = ?").run(entityId);
-        break;
-      case "fund":
-        db.prepare("DELETE FROM external_funds WHERE id = ?").run(entityId);
-        break;
-      case "fundRepayment":
-        db.prepare("DELETE FROM fund_repayments WHERE id = ?").run(entityId);
-        break;
-      case "user": {
-        const row = db.prepare("SELECT * FROM users WHERE id = ?").get(entityId);
-        if (row && row.username !== "admin") {
-          db.prepare("DELETE FROM users WHERE id = ?").run(entityId);
-        }
-        break;
-      }
-      default:
-        throw new Error(`Unknown entity type: ${entityType}`);
+    const table = DELETABLE_TYPES[entityType];
+    if (!table) return false;
+    if (entityType === "user") {
+      const row = db
+        .prepare("SELECT * FROM users WHERE id = ?")
+        .get(idText(entityId));
+      if (!row || String(row.username).toLowerCase() === "admin") return false;
     }
+    const result = db
+      .prepare(`DELETE FROM ${table} WHERE id = ?`)
+      .run(idText(entityId));
+    return result.changes > 0;
   }
 
   const approveTx = db.transaction(({ actor, id }) => {
-    const req = db.prepare("SELECT * FROM deletion_requests WHERE id = ?").get(id);
+    const req = db
+      .prepare("SELECT * FROM deletion_requests WHERE id = ?")
+      .get(idText(id));
     if (!req) return { ok: false, error: "Request not found." };
     if (req.status !== "pending") return { ok: false, error: "This request is already resolved." };
-    executeDeletion(req.entity_type, req.entity_id);
+    if (!executeDeletion(req.entity_type, req.entity_id)) {
+      return { ok: false, error: "That record no longer exists or can't be deleted." };
+    }
     db.prepare(
       "UPDATE deletion_requests SET status = 'approved', resolved_at = ?, resolved_by = ? WHERE id = ?"
-    ).run(nowIso(), actor, id);
+    ).run(nowIso(), actor, req.id);
     logAudit(db, actor, `Approved deletion request: ${req.entity_label}`);
     return { ok: true };
   });
@@ -906,12 +1144,14 @@ function createMutations(ctx, auth) {
   }
 
   function deletionReject({ actor, id }) {
-    const req = db.prepare("SELECT * FROM deletion_requests WHERE id = ?").get(id);
+    const req = db
+      .prepare("SELECT * FROM deletion_requests WHERE id = ?")
+      .get(idText(id));
     if (!req) return { ok: false, error: "Request not found." };
     if (req.status !== "pending") return { ok: false, error: "This request is already resolved." };
     db.prepare(
       "UPDATE deletion_requests SET status = 'rejected', resolved_at = ?, resolved_by = ? WHERE id = ?"
-    ).run(nowIso(), actor, id);
+    ).run(nowIso(), actor, req.id);
     logAudit(db, actor, `Rejected deletion request: ${req.entity_label}`);
     return { ok: true };
   }
@@ -919,7 +1159,9 @@ function createMutations(ctx, auth) {
   /* ------------------------------- audit helper -------------------------------- */
 
   function auditLog({ actor, action }) {
-    logAudit(db, actor, action);
+    const clean = note(action, 2000);
+    if (!clean) return { ok: false, error: "Nothing to record." };
+    logAudit(db, actor, clean);
     return { ok: true };
   }
 
@@ -927,7 +1169,7 @@ function createMutations(ctx, auth) {
 
   const autoRenewTx = db.transaction(({ limit }) => {
     const today = todayUtc();
-    const batch = Math.min(Math.max(num(limit) || 500, 1), 5000);
+    const batch = int(limit, 1, 5000, 500);
     const due = db
       .prepare(
         `SELECT id FROM loans

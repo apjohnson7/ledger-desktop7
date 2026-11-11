@@ -5,7 +5,21 @@ const path = require("path");
 const crypto = require("crypto");
 const { createSchema } = require("./schema");
 const { hashPassword } = require("./auth");
-const { uid, todayUtc } = require("./util");
+const {
+  uid,
+  todayUtc,
+  money,
+  int,
+  text,
+  note,
+  idText,
+  dateOnly,
+  optionalDate,
+  CURRENCY_CODES,
+  LANGUAGES,
+  ROLE_NAMES,
+  MAX_INSTALMENTS,
+} = require("./util");
 
 const ARRAY_KEYS = [
   "borrowers",
@@ -21,6 +35,17 @@ const ARRAY_KEYS = [
 ];
 
 const arr = (value) => (Array.isArray(value) ? value : []);
+const MAX_IMPORT_ROWS = 2_000_000;
+
+function safePhotos(photos) {
+  if (!Array.isArray(photos)) return "[]";
+  try {
+    const json = JSON.stringify(photos.slice(0, 10));
+    return json.length > 2 * 1024 * 1024 ? "[]" : json;
+  } catch (e) {
+    return "[]";
+  }
+}
 
 /** Reads the old encrypted/plain single-file store. Returns the inner data
  *  object (the same shape the renderer used), or null when nothing exists. */
@@ -68,6 +93,16 @@ function readLegacyData(ctx) {
 function importData(ctx, sourceData, { onProgress } = {}) {
   const data = sourceData || {};
   const { db } = ctx;
+
+  let totalRows = 0;
+  for (const key of ARRAY_KEYS) {
+    if (Array.isArray(data[key])) totalRows += data[key].length;
+  }
+  if (totalRows > MAX_IMPORT_ROWS) {
+    throw new Error(
+      `That backup contains ${totalRows.toLocaleString()} records, which is more than this app can safely restore at once.`
+    );
+  }
 
   for (const key of ARRAY_KEYS) {
     if (data[key] != null && !Array.isArray(data[key])) {
@@ -168,26 +203,40 @@ function importData(ctx, sourceData, { onProgress } = {}) {
   const counts = {};
   const run = db.transaction(() => {
     const settings = data.settings || {};
-    if (settings.businessName != null) insertSetting.run("businessName", String(settings.businessName));
-    if (settings.language != null) insertSetting.run("language", String(settings.language));
+    if (settings.businessName != null) {
+      insertSetting.run(
+        "businessName",
+        text(settings.businessName, 200, "My Lending Business")
+      );
+    }
+    if (settings.language != null && LANGUAGES.includes(settings.language)) {
+      insertSetting.run("language", settings.language);
+    }
+    if (settings.currency != null) {
+      const code = String(settings.currency).toUpperCase();
+      if (CURRENCY_CODES.includes(code)) insertSetting.run("currency", code);
+    }
     if (settings.startingCashBalance != null) {
-      insertSetting.run("startingCashBalance", String(Number(settings.startingCashBalance) || 0));
+      insertSetting.run(
+        "startingCashBalance",
+        String(money(settings.startingCashBalance))
+      );
     }
 
     const borrowers = arr(data.borrowers);
     borrowers.forEach((b, i) => {
       insertBorrower.run({
-        id: b.id || uid("bor"),
-        full_name: b.fullName || b.name || `Borrower ${i + 1}`,
-        phone: b.phone || "",
-        alt_phone: b.altPhone || "",
-        national_id: b.nationalId || "",
-        address: b.address || "",
-        occupation: b.occupation || "",
-        next_of_kin: b.nextOfKin || "",
-        next_of_kin_phone: b.nextOfKinPhone || "",
-        notes: b.notes || "",
-        date_registered: b.dateRegistered || todayUtc(),
+        id: idText(b.id) || uid("bor"),
+        full_name: text(b.fullName || b.name, 200, `Borrower ${i + 1}`),
+        phone: text(b.phone, 60),
+        alt_phone: text(b.altPhone, 60),
+        national_id: text(b.nationalId, 60),
+        address: text(b.address, 300),
+        occupation: text(b.occupation, 120),
+        next_of_kin: text(b.nextOfKin, 200),
+        next_of_kin_phone: text(b.nextOfKinPhone, 60),
+        notes: note(b.notes),
+        date_registered: dateOnly(b.dateRegistered, todayUtc()),
       });
     });
     counts.borrowers = borrowers.length;
@@ -195,32 +244,45 @@ function importData(ctx, sourceData, { onProgress } = {}) {
     const loans = arr(data.loans);
     loans.forEach((l, i) => {
       const inst = l.instalments || null;
-      const year = String(l.issueDate || todayUtc()).slice(0, 4);
+      const issueDate = dateOnly(l.issueDate, todayUtc());
+      const year = issueDate.slice(0, 4);
+      const interestType = l.interestType === "Fixed" ? "Fixed" : "Percent";
       insertLoan.run({
-        id: l.id || uid("loan"),
-        loan_number: l.loanNumber || `LN-${year}-IMP${String(i + 1).padStart(4, "0")}`,
-        borrower_id: l.borrowerId || "",
-        amount: Number(l.amount) || 0,
-        interest_type: l.interestType || "Percent",
-        interest_value: Number(l.interestValue) || 0,
-        paperwork_fee: Number(l.paperworkFee) || 0,
-        total_payable: Number(l.totalPayable) || 0,
-        issue_date: l.issueDate || todayUtc(),
-        due_date: l.dueDate || l.issueDate || todayUtc(),
-        repayment_method: l.repaymentMethod || "Full Payment",
-        instalment_count: inst ? Number(inst.count) || 0 : null,
-        instalment_frequency: inst ? inst.frequency || "Monthly" : null,
-        instalment_amount: inst ? Number(inst.expectedAmount) || 0 : null,
-        instalment_first_date: inst ? inst.firstPaymentDate || null : null,
+        id: idText(l.id) || uid("loan"),
+        loan_number: text(
+          l.loanNumber,
+          60,
+          `LN-${year}-IMP${String(i + 1).padStart(4, "0")}`
+        ),
+        borrower_id: idText(l.borrowerId),
+        amount: money(l.amount),
+        interest_type: interestType,
+        interest_value: money(l.interestValue),
+        paperwork_fee: money(l.paperworkFee),
+        total_payable: money(l.totalPayable),
+        issue_date: issueDate,
+        due_date: dateOnly(l.dueDate, issueDate),
+        repayment_method:
+          l.repaymentMethod === "Instalments" ? "Instalments" : "Full Payment",
+        instalment_count: inst
+          ? int(inst.count, 0, MAX_INSTALMENTS, 0)
+          : null,
+        instalment_frequency: inst
+          ? text(inst.frequency, 40, "Monthly")
+          : null,
+        instalment_amount: inst ? money(inst.expectedAmount) : null,
+        instalment_first_date: inst
+          ? dateOnly(inst.firstPaymentDate, issueDate)
+          : null,
         voided: l.voided ? 1 : 0,
-        void_reason: l.voidReason || "",
-        voided_at: l.voidedAt || "",
+        void_reason: text(l.voidReason, 1000),
+        voided_at: text(l.voidedAt, 40),
         renewed: l.renewed ? 1 : 0,
-        renewed_from_id: l.renewedFromId || null,
-        renewed_into_id: l.renewedIntoId || null,
-        renewed_at: l.renewedAt || "",
+        renewed_from_id: idText(l.renewedFromId) || null,
+        renewed_into_id: idText(l.renewedIntoId) || null,
+        renewed_at: text(l.renewedAt, 40),
         auto_renewed: l.autoRenewed ? 1 : 0,
-        issued_at: l.issuedAt || "",
+        issued_at: text(l.issuedAt, 40),
         is_historical: l.isHistorical ? 1 : 0,
       });
     });
@@ -228,19 +290,21 @@ function importData(ctx, sourceData, { onProgress } = {}) {
 
     const payments = arr(data.payments);
     payments.forEach((p) => {
+      const date = dateOnly(p.date, todayUtc());
       insertPayment.run({
-        id: p.id || uid("pay"),
-        loan_id: p.loanId || "",
-        borrower_id: p.borrowerId || null,
-        amount: Number(p.amount) || 0,
-        principal_paid: p.principalPaid != null ? Number(p.principalPaid) || 0 : Number(p.amount) || 0,
-        interest_paid: p.interestPaid != null ? Number(p.interestPaid) || 0 : 0,
-        date: p.date || todayUtc(),
-        method: p.method || "Cash",
-        reference: p.reference || "",
-        notes: p.notes || "",
+        id: idText(p.id) || uid("pay"),
+        loan_id: idText(p.loanId),
+        borrower_id: idText(p.borrowerId) || null,
+        amount: money(p.amount),
+        principal_paid:
+          p.principalPaid != null ? money(p.principalPaid) : money(p.amount),
+        interest_paid: money(p.interestPaid),
+        date,
+        method: text(p.method, 60, "Cash"),
+        reference: text(p.reference, 200),
+        notes: note(p.notes),
         voided: p.voided ? 1 : 0,
-        created_at: p.createdAt || `${p.date || todayUtc()}T00:00:00.000Z`,
+        created_at: text(p.createdAt, 40, `${date}T00:00:00.000Z`),
       });
     });
     counts.payments = payments.length;
@@ -248,21 +312,21 @@ function importData(ctx, sourceData, { onProgress } = {}) {
     const collateral = arr(data.collateral);
     collateral.forEach((c) => {
       insertCollateral.run({
-        id: c.id || uid("col"),
-        loan_id: c.loanId || null,
-        borrower_id: c.borrowerId || null,
-        description: c.description || "",
-        category: c.category || "",
-        brand: c.brand || "",
-        model: c.model || "",
-        serial: c.serial || "",
-        estimated_value: Number(c.estimatedValue) || 0,
-        condition: c.condition || "",
-        date_received: c.dateReceived || todayUtc(),
-        storage_location: c.storageLocation || "",
-        status: c.status || "Held",
-        notes: c.notes || "",
-        photos: JSON.stringify(Array.isArray(c.photos) ? c.photos : []),
+        id: idText(c.id) || uid("col"),
+        loan_id: idText(c.loanId) || null,
+        borrower_id: idText(c.borrowerId) || null,
+        description: text(c.description, 300),
+        category: text(c.category, 80),
+        brand: text(c.brand, 120),
+        model: text(c.model, 120),
+        serial: text(c.serial, 120),
+        estimated_value: money(c.estimatedValue),
+        condition: text(c.condition, 120),
+        date_received: dateOnly(c.dateReceived, todayUtc()),
+        storage_location: text(c.storageLocation, 200),
+        status: text(c.status, 40, "Held"),
+        notes: note(c.notes),
+        photos: safePhotos(c.photos),
       });
     });
     counts.collateral = collateral.length;
@@ -270,13 +334,13 @@ function importData(ctx, sourceData, { onProgress } = {}) {
     const expenses = arr(data.expenses);
     expenses.forEach((e) => {
       insertExpense.run({
-        id: e.id || uid("exp"),
-        description: e.description || "",
-        category: e.category || "Other",
-        amount: Number(e.amount) || 0,
-        date: e.date || todayUtc(),
-        method: e.method || "Cash",
-        notes: e.notes || "",
+        id: idText(e.id) || uid("exp"),
+        description: text(e.description, 300),
+        category: text(e.category, 80, "Other"),
+        amount: money(e.amount),
+        date: dateOnly(e.date, todayUtc()),
+        method: text(e.method, 60, "Cash"),
+        notes: note(e.notes),
         voided: e.voided ? 1 : 0,
       });
     });
@@ -285,13 +349,13 @@ function importData(ctx, sourceData, { onProgress } = {}) {
     const funds = arr(data.externalFunds);
     funds.forEach((f) => {
       insertFund.run({
-        id: f.id || uid("fund"),
-        type: f.type || "External Loan",
-        source: f.source || "",
-        amount: Number(f.amount) || 0,
-        date_received: f.dateReceived || todayUtc(),
-        expected_repayment_date: f.expectedRepaymentDate || "",
-        notes: f.notes || "",
+        id: idText(f.id) || uid("fund"),
+        type: text(f.type, 80, "External Loan"),
+        source: text(f.source, 200),
+        amount: money(f.amount),
+        date_received: dateOnly(f.dateReceived, todayUtc()),
+        expected_repayment_date: optionalDate(f.expectedRepaymentDate),
+        notes: note(f.notes),
         voided: f.voided ? 1 : 0,
       });
     });
@@ -300,12 +364,12 @@ function importData(ctx, sourceData, { onProgress } = {}) {
     const fundRepayments = arr(data.fundRepayments);
     fundRepayments.forEach((r) => {
       insertFundRepayment.run({
-        id: r.id || uid("fundpay"),
-        fund_id: r.fundId || null,
-        amount: Number(r.amount) || 0,
-        date: r.date || todayUtc(),
-        method: r.method || "Cash",
-        notes: r.notes || "",
+        id: idText(r.id) || uid("fundpay"),
+        fund_id: idText(r.fundId) || null,
+        amount: money(r.amount),
+        date: dateOnly(r.date, todayUtc()),
+        method: text(r.method, 60, "Cash"),
+        notes: note(r.notes),
         voided: r.voided ? 1 : 0,
       });
     });
@@ -314,10 +378,10 @@ function importData(ctx, sourceData, { onProgress } = {}) {
     const auditLog = arr(data.auditLog);
     auditLog.forEach((e) => {
       insertAudit.run({
-        id: e.id || uid("log"),
-        timestamp: e.timestamp || nowStamp(),
-        username: e.username || "",
-        action: e.action || "",
+        id: idText(e.id) || uid("log"),
+        timestamp: text(e.timestamp, 40, nowStamp()),
+        username: text(e.username, 200),
+        action: note(e.action, 2000),
       });
     });
     counts.auditLog = auditLog.length;
@@ -325,37 +389,39 @@ function importData(ctx, sourceData, { onProgress } = {}) {
     const deletionRequests = arr(data.deletionRequests);
     deletionRequests.forEach((r) => {
       insertDeletion.run({
-        id: r.id || uid("delreq"),
-        entity_type: r.entityType || "",
-        entity_id: r.entityId || "",
-        entity_label: r.entityLabel || "",
-        requested_by: r.requestedBy || "",
-        requested_by_name: r.requestedByName || "",
-        status: r.status || "pending",
-        created_at: r.createdAt || nowStamp(),
-        resolved_at: r.resolvedAt || null,
-        resolved_by: r.resolvedBy || null,
+        id: idText(r.id) || uid("delreq"),
+        entity_type: text(r.entityType, 40),
+        entity_id: idText(r.entityId),
+        entity_label: text(r.entityLabel, 300),
+        requested_by: idText(r.requestedBy),
+        requested_by_name: text(r.requestedByName, 200),
+        status: text(r.status, 40, "pending"),
+        created_at: text(r.createdAt, 40, nowStamp()),
+        resolved_at: text(r.resolvedAt, 40) || null,
+        resolved_by: idText(r.resolvedBy) || null,
       });
     });
     counts.deletionRequests = deletionRequests.length;
 
     const users = arr(data.users);
     users.forEach((u) => {
-      let passwordHash = u.passwordHash || null;
-      let passwordSalt = u.passwordSalt || null;
+      let passwordHash = text(u.passwordHash, 200) || null;
+      let passwordSalt = text(u.passwordSalt, 200) || null;
       if (!passwordHash && u.password) {
         passwordSalt = crypto.randomBytes(16).toString("hex");
-        passwordHash = hashPassword(u.password, passwordSalt);
+        passwordHash = hashPassword(text(u.password, 200), passwordSalt);
       }
+      const username = text(u.username, 64);
       insertUser.run({
-        id: u.id || uid("usr"),
-        username: u.username || `user${Math.random().toString(36).slice(2, 8)}`,
+        id: idText(u.id) || uid("usr"),
+        username: username || `user${Math.random().toString(36).slice(2, 8)}`,
         password_hash: passwordHash,
         password_salt: passwordSalt,
-        full_name: u.fullName || u.username || "",
-        role: u.role || "Loan Officer",
-        active: u.active === false ? 0 : 1,
-        created_at: u.createdAt || todayUtc(),
+        full_name: text(u.fullName, 200, username),
+        role: ROLE_NAMES.includes(u.role) ? u.role : "Loan Officer",
+        active:
+          u.active === false || u.active === 0 || u.active === "0" ? 0 : 1,
+        created_at: text(u.createdAt, 40, todayUtc()),
       });
     });
     counts.users = users.length;
@@ -402,6 +468,82 @@ function importData(ctx, sourceData, { onProgress } = {}) {
   return { imported: true, counts };
 }
 
+/** Rejects backups that would leave the ledger unusable or silently drop
+ *  whole tables. Called before any existing data is deleted. */
+function validateRestoreData(data, { strict = false } = {}) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("That file doesn't look like a Ledger backup.");
+  }
+
+  const required = strict
+    ? ARRAY_KEYS
+    : ["borrowers", "loans", "payments", "users"];
+  for (const key of required) {
+    if (!Array.isArray(data[key])) {
+      throw new Error(
+        `That backup is incomplete: the "${key}" section is missing. Nothing was changed.`
+      );
+    }
+  }
+  for (const key of ARRAY_KEYS) {
+    if (data[key] != null && !Array.isArray(data[key])) {
+      throw new Error(
+        `That backup is damaged: the "${key}" section isn't a list. Nothing was changed.`
+      );
+    }
+  }
+
+  let totalRows = 0;
+  for (const key of ARRAY_KEYS) {
+    if (Array.isArray(data[key])) totalRows += data[key].length;
+  }
+  if (totalRows > MAX_IMPORT_ROWS) {
+    throw new Error(
+      `That backup contains ${totalRows.toLocaleString()} records, which is more than this app can safely restore at once. Nothing was changed.`
+    );
+  }
+
+  const users = data.users || [];
+  if (users.length === 0) {
+    throw new Error(
+      "That backup has no user accounts. Restoring it would lock you out, so nothing was changed."
+    );
+  }
+  const isActiveUser = (u) =>
+    !!u &&
+    u.active !== false &&
+    u.active !== 0 &&
+    u.active !== "0";
+  const admins = users.filter(
+    (u) => isActiveUser(u) && u.role === "Administrator"
+  );
+  if (admins.length === 0) {
+    throw new Error(
+      "That backup has no active Administrator account. Restoring it would lock you out, so nothing was changed."
+    );
+  }
+  const usable = admins.some(
+    (u) => (u.passwordHash && u.passwordSalt) || u.password
+  );
+  if (!usable) {
+    throw new Error(
+      "That backup's administrator account has no password. Restoring it would lock you out, so nothing was changed."
+    );
+  }
+  const seen = new Set();
+  for (const user of users) {
+    const name = String((user && user.username) || "").toLowerCase();
+    if (!name) continue;
+    if (seen.has(name)) {
+      throw new Error(
+        `That backup contains two users named "${name}". Nothing was changed.`
+      );
+    }
+    seen.add(name);
+  }
+  return true;
+}
+
 function importLegacy(ctx, options = {}) {
   const found = readLegacyData(ctx);
   if (!found) return { imported: false };
@@ -413,7 +555,8 @@ function importLegacy(ctx, options = {}) {
 /** Replaces every table with the contents of a parsed backup. Used by the
  *  Settings page's "Restore from backup file" action. The whole replacement
  *  runs in one transaction, so a bad file leaves the current data untouched. */
-function replaceAllData(ctx, data) {
+function replaceAllData(ctx, data, options = {}) {
+  validateRestoreData(data, options);
   const { db } = ctx;
   db.pragma("foreign_keys = OFF");
   db.exec("BEGIN IMMEDIATE");
@@ -458,4 +601,11 @@ function nowStamp() {
   return new Date().toISOString();
 }
 
-module.exports = { importLegacy, importData, replaceAllData, readLegacyData };
+module.exports = {
+  importLegacy,
+  importData,
+  replaceAllData,
+  readLegacyData,
+  validateRestoreData,
+  ARRAY_KEYS,
+};

@@ -18,9 +18,14 @@ contextBridge.exposeInMainWorld("ledger", {
 
   auth: group({
     login: "auth.login",
+    session: "auth.session",
     logout: "auth.logout",
     changePassword: "auth.changePassword",
   }),
+
+  /** Renderer-side crashes are logged next to crash.log in the data folder,
+   *  where support can inspect them even when the window is unusable. */
+  logError: (payload) => ipcRenderer.invoke("ledger:logError", payload),
 
   bootstrap: () => call("bootstrap"),
   dashboard: () => call("dashboard"),

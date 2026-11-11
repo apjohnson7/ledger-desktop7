@@ -11,7 +11,8 @@
 
 const fs = require("fs");
 const path = require("path");
-const { replaceAllData } = require("./legacy");
+const Database = require("better-sqlite3-multiple-ciphers");
+const { replaceAllData, validateRestoreData } = require("./legacy");
 const {
   borrowerRow,
   loanRow,
@@ -22,12 +23,12 @@ const {
   fundRepaymentRow,
   auditRow,
   deletionRow,
-  userRow,
 } = require("./rows");
 const { getSettings } = require("./util");
 
 const MAX_BACKUPS = 20;
 const MAX_BACKUP_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB for the whole folder
+const MAX_RESTORE_BYTES = 512 * 1024 * 1024; // keep JSON.parse inside safe memory
 const AUTO_PREFIX = "ledger-store.";
 const DEBOUNCE_MS = 5 * 60 * 1000; // 5 quiet minutes after a change
 const MIN_INTERVAL_MS = 30 * 60 * 1000; // at most one automatic backup per 30 min
@@ -42,7 +43,7 @@ const SECTIONS = [
   ["fundRepayments", "fund_repayments", "date DESC, id", fundRepaymentRow],
   ["auditLog", "audit_log", "timestamp DESC, id", auditRow],
   ["deletionRequests", "deletion_requests", "created_at DESC, id", deletionRow],
-  ["users", "users", "username COLLATE NOCASE ASC", userRow],
+  ["users", "users", "username COLLATE NOCASE ASC", backupUser],
 ];
 
 /* Fields that are derived at read time and are not part of the stored data.
@@ -89,12 +90,29 @@ function compactFundRepayment(row) {
   return value;
 }
 
+/* Users are the one table where a readable backup still needs the stored
+   PBKDF2 hash and salt: without them a restore creates accounts nobody can
+   sign in to. Passwords themselves are never exported. */
+function backupUser(row) {
+  return {
+    id: row.id,
+    username: row.username,
+    passwordHash: row.password_hash || "",
+    passwordSalt: row.password_salt || "",
+    fullName: row.full_name || "",
+    role: row.role || "Viewer",
+    active: !!row.active,
+    createdAt: row.created_at || "",
+  };
+}
+
 const COMPACT = {
   loans: compactLoan,
   payments: compactPayment,
   collateral: compactCollateral,
   externalFunds: compactFund,
   fundRepayments: compactFundRepayment,
+  users: backupUser,
 };
 
 const timeStamp = () => new Date().toISOString().replace(/[:.]/g, "-");
@@ -128,6 +146,7 @@ function createBackup(ctx) {
   let timer = null;
   let interval = null;
   let writing = null;
+  let restoring = false;
   let dirtyAt = 0;
   let lastBackupAt = 0;
 
@@ -162,17 +181,30 @@ function createBackup(ctx) {
         }
       });
 
-    const settings = getSettings(db);
-    let buffer = "";
-    const flush = async (force) => {
-      if (buffer.length >= 1024 * 1024 || (force && buffer.length)) {
-        const chunk = buffer;
-        buffer = "";
-        await write(chunk);
-      }
-    };
-
+    // Read every table from a separate read-only connection. A backup made on
+    // the same connection as the writes can otherwise catch the ledger halfway
+    // through a mutation (for example a loan written before its payment).
+    let snapshot = null;
     try {
+      snapshot = new Database(ctx.dbFile, {
+        readonly: true,
+        fileMustExist: true,
+      });
+      snapshot.pragma(`key='${String(ctx.key).replace(/'/g, "''")}'`);
+      snapshot.pragma("busy_timeout = 5000");
+      snapshot.pragma("query_only = ON");
+      snapshot.exec("BEGIN");
+
+      const settings = getSettings(snapshot);
+      let buffer = "";
+      const flush = async (force) => {
+        if (buffer.length >= 1024 * 1024 || (force && buffer.length)) {
+          const chunk = buffer;
+          buffer = "";
+          await write(chunk);
+        }
+      };
+
       const header = {
         format: "ledger-backup",
         formatVersion: 2,
@@ -188,7 +220,9 @@ function createBackup(ctx) {
       for (const [name, table, order, mapper] of SECTIONS) {
         buffer += `,${JSON.stringify(name)}:[`;
         let first = true;
-        const rows = db.prepare(`SELECT * FROM ${table} ORDER BY ${order}`).iterate();
+        const rows = snapshot
+          .prepare(`SELECT * FROM ${table} ORDER BY ${order}`)
+          .iterate();
         for (const row of rows) {
           const value = (COMPACT[name] || mapper)(row);
           buffer += `${first ? "" : ","}${JSON.stringify(value)}`;
@@ -206,6 +240,14 @@ function createBackup(ctx) {
         out.once("error", reject);
         out.end(() => (streamError ? reject(streamError) : resolve()));
       });
+
+      // Make sure the bytes are on disk before the file becomes visible.
+      const handle = await fs.promises.open(temp, "r+");
+      try {
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
       await fs.promises.rename(temp, dest);
       return { ok: true, path: dest, size: (await fs.promises.stat(dest)).size };
     } catch (error) {
@@ -220,6 +262,19 @@ function createBackup(ctx) {
         /* ignore */
       }
       throw error;
+    } finally {
+      if (snapshot) {
+        try {
+          snapshot.exec("ROLLBACK");
+        } catch (e) {
+          /* the read transaction may not have started */
+        }
+        try {
+          snapshot.close();
+        } catch (e) {
+          /* ignore */
+        }
+      }
     }
   }
 
@@ -249,7 +304,10 @@ function createBackup(ctx) {
     }
   }
 
-  async function createAutoBackup(reason = "automatic") {
+  async function createAutoBackup(reason = "automatic", { force = false } = {}) {
+    if (restoring && !force) {
+      throw new Error("A backup restore is in progress. Try again in a moment.");
+    }
     if (writing) return writing;
     writing = (async () => {
       const dest = path.join(backupsDir, `${AUTO_PREFIX}${timeStamp()}.json`);
@@ -302,6 +360,22 @@ function createBackup(ctx) {
 
   function start() {
     try {
+      // Remove half-written files left behind by a previous crash.
+      for (const name of fs.readdirSync(backupsDir)) {
+        if (!name.endsWith(".tmp")) continue;
+        const file = path.join(backupsDir, name);
+        try {
+          if (Date.now() - fs.statSync(file).mtimeMs > 60 * 60 * 1000) {
+            fs.unlinkSync(file);
+          }
+        } catch (e) {
+          /* ignore */
+        }
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    try {
       db.prepare(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('lastBackupAt', ?)"
       ).run(new Date().toISOString());
@@ -325,17 +399,31 @@ function createBackup(ctx) {
     interval = null;
   }
 
+  function latestAutomatic() {
+    return (
+      backupFiles(backupsDir).find((file) =>
+        file.name.startsWith(AUTO_PREFIX)
+      ) || null
+    );
+  }
+
   function info() {
     const last = db
       .prepare("SELECT value FROM meta WHERE key = 'lastBackupAt'")
+      .get();
+    const lastRestore = db
+      .prepare("SELECT value FROM meta WHERE key = 'lastRestoreAt'")
       .get();
     return {
       database: ctx.dbFile,
       keyFile: ctx.keyFile,
       backupsDir,
       lastBackupAt: last ? last.value : null,
+      lastRestoreAt: lastRestore ? lastRestore.value : null,
       maxBackups: MAX_BACKUPS,
       maxBytes: MAX_BACKUP_BYTES,
+      maxRestoreBytes: MAX_RESTORE_BYTES,
+      restoring,
       files: backupFiles(backupsDir),
     };
   }
@@ -346,54 +434,76 @@ function createBackup(ctx) {
 
   /** Restores a JSON backup. The file can be one of this app's snapshots, a
    *  full backup exported by an older version, or the old encrypted store
-   *  contents exported to JSON. Existing data is replaced atomically. */
+   *  contents exported to JSON. Existing data is replaced atomically, but
+   *  only after a complete safety snapshot has been written successfully. */
   async function restoreFromFile(file) {
-    const raw = fs.readFileSync(file);
-    let parsed;
-    const text = raw.toString("utf8");
-    try {
-      parsed = JSON.parse(text);
-    } catch (e) {
-      throw new Error("That file is not valid JSON, so it can't be restored.");
+    if (restoring) {
+      throw new Error("A restore is already in progress.");
     }
-
-    let data = parsed;
-    if (parsed && typeof parsed["personal:ledger-data-v1"] === "string") {
-      try {
-        data = JSON.parse(parsed["personal:ledger-data-v1"]);
-      } catch (e) {
-        throw new Error("That backup contains unreadable ledger data.");
+    restoring = true;
+    try {
+      const stat = await fs.promises.stat(file);
+      if (!stat.isFile()) {
+        throw new Error("That path is not a backup file.");
       }
-    } else if (parsed && parsed["personal:ledger-data-v1"] && typeof parsed["personal:ledger-data-v1"] === "object") {
-      data = parsed["personal:ledger-data-v1"];
-    } else if (
-      parsed &&
-      parsed.data &&
-      typeof parsed.data === "object" &&
-      (Array.isArray(parsed.data.borrowers) || Array.isArray(parsed.data.loans))
-    ) {
-      data = parsed.data;
-    }
+      if (stat.size > MAX_RESTORE_BYTES) {
+        throw new Error(
+          "That backup file is too large to restore safely in this app. Nothing was changed."
+        );
+      }
+      const raw = await fs.promises.readFile(file);
+      let parsed;
+      try {
+        parsed = JSON.parse(raw.toString("utf8"));
+      } catch (e) {
+        throw new Error("That file is not valid JSON, so it can't be restored.");
+      }
 
-    if (!data || typeof data !== "object" || Array.isArray(data)) {
-      throw new Error("That file doesn't look like a Ledger backup.");
-    }
-    if (
-      !Array.isArray(data.borrowers) &&
-      !Array.isArray(data.loans) &&
-      !Array.isArray(data.payments)
-    ) {
-      throw new Error("That file doesn't look like a Ledger backup.");
-    }
+      let data = parsed;
+      if (parsed && typeof parsed["personal:ledger-data-v1"] === "string") {
+        try {
+          data = JSON.parse(parsed["personal:ledger-data-v1"]);
+        } catch (e) {
+          throw new Error("That backup contains unreadable ledger data.");
+        }
+      } else if (
+        parsed &&
+        parsed["personal:ledger-data-v1"] &&
+        typeof parsed["personal:ledger-data-v1"] === "object"
+      ) {
+        data = parsed["personal:ledger-data-v1"];
+      } else if (
+        parsed &&
+        parsed.data &&
+        typeof parsed.data === "object" &&
+        (Array.isArray(parsed.data.borrowers) ||
+          Array.isArray(parsed.data.loans))
+      ) {
+        data = parsed.data;
+      }
 
-    // Keep a recovery point of the current data before replacing it. Failure
-    // to write this safety copy should not block an intentional restore.
-    try {
-      await createAutoBackup("pre-restore");
-    } catch (e) {
-      console.error("Could not write pre-restore backup:", e);
+      // A file written by this version declares its format. For those we
+      // require every section, so a truncated export can't silently erase
+      // tables. Older single-store files only need the core sections.
+      const strict = !!(parsed && parsed.format === "ledger-backup");
+      validateRestoreData(data, { strict });
+
+      // Never replace live data without a valid recovery point. If the
+      // safety backup cannot be written, the restore is cancelled.
+      if (writing) await writing;
+      await createAutoBackup("pre-restore", { force: true });
+      const result = replaceAllData(ctx, data, { strict });
+      try {
+        db.prepare(
+          "INSERT OR REPLACE INTO meta (key, value) VALUES ('lastRestoreAt', ?)"
+        ).run(new Date().toISOString());
+      } catch (e) {
+        /* meta is optional */
+      }
+      return { ok: true, ...result };
+    } finally {
+      restoring = false;
     }
-    return replaceAllData(ctx, data);
   }
 
   return {
@@ -405,7 +515,10 @@ function createBackup(ctx) {
     start,
     stop,
     info,
+    latestAutomatic,
+    isRestoring: () => restoring,
     list: () => backupFiles(backupsDir),
+    maxRestoreBytes: MAX_RESTORE_BYTES,
   };
 }
 
