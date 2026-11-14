@@ -5,6 +5,19 @@ installs and runs fully offline. Records live in a local encrypted SQLite
 database on the computer it's installed on — nothing is synced or sent
 anywhere.
 
+## Download the installers
+
+The ready-to-install builds are on the
+[Releases page](https://github.com/apjohnson7/ledger-desktop7/releases/latest):
+
+- **Windows:** [Ledger.Setup.1.0.0.exe](https://github.com/apjohnson7/ledger-desktop7/releases/download/v1.0.0/Ledger.Setup.1.0.0.exe)
+- **macOS Intel:** [Ledger-1.0.0.dmg](https://github.com/apjohnson7/ledger-desktop7/releases/download/v1.0.0/Ledger-1.0.0.dmg)
+- **macOS Apple Silicon:** [Ledger-1.0.0-arm64.dmg](https://github.com/apjohnson7/ledger-desktop7/releases/download/v1.0.0/Ledger-1.0.0-arm64.dmg)
+
+`.zip` builds for both Mac architectures are attached to the same release.
+The builds are unsigned: on macOS, right-click the app and choose **Open**
+once; on Windows, choose **More info → Run anyway** if SmartScreen appears.
+
 ## What changed from the Claude.ai version
 
 The screen layout and workflow are the same, but storage is now local and
@@ -109,9 +122,10 @@ desktop shortcut.
 npm run dist:mac
 ```
 
-This produces `.dmg` and `.zip` files in `release/`. The included
-`.github/workflows/build-mac.yml` workflow builds the same artifacts on a
-GitHub macOS runner.
+This produces `.dmg` and `.zip` files for both Intel and Apple Silicon in
+`release/`. The included `.github/workflows/release.yml` workflow builds the
+same artifacts on GitHub macOS runners and publishes them to a GitHub
+Release.
 
 ## Security
 
