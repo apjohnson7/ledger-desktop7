@@ -52,9 +52,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
+          # GitHub retired the macos-13 and macos-14 images. These are the
+          # current Intel and Apple Silicon labels for public repositories.
+          - runner: macos-15-intel
             arch: x64
-          - runner: macos-14
+          - runner: macos-15
             arch: arm64
     steps:
       - uses: actions/checkout@v4
