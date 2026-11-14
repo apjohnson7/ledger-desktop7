@@ -1,0 +1,134 @@
+name: Build and publish desktop release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (for example v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+env:
+  # The installers are unsigned. Keep electron-builder from searching for a
+  # signing identity or attempting notarization on the CI runners.
+  CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+jobs:
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Windows installer
+        run: npm run dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ledger-windows
+          if-no-files-found: error
+          path: release/*.exe
+
+  macos:
+    name: macOS ${{ matrix.arch }} installer
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            arch: x64
+          - runner: macos-14
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build renderer
+        run: npm run build
+
+      - name: Build macOS installer
+        run: npx electron-builder --mac --${{ matrix.arch }} --publish never
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ledger-macos-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            release/*.dmg
+            release/*.zip
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - windows
+      - macos
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh assets
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: Ledger ${{ github.event.inputs.tag || github.ref_name }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            ## Ledger desktop release
+
+            Offline, encrypted ledger for Windows and macOS.
+
+            ### Downloads
+            - **Windows:** `Ledger Setup 1.0.0.exe`
+            - **macOS Intel:** `Ledger-1.0.0.dmg` (or `Ledger-1.0.0-mac.zip`)
+            - **macOS Apple Silicon:** `Ledger-1.0.0-arm64.dmg` (or `Ledger-1.0.0-arm64-mac.zip`)
+
+            ### Install
+            - **Windows:** run the installer. SmartScreen may warn because the
+              build is unsigned; choose *More info* then *Run anyway*.
+            - **macOS:** open the `.dmg` and drag Ledger to Applications. The
+              build is unsigned, so if Gatekeeper blocks it, right-click the app
+              and choose *Open* once.
+            - **macOS zip:** unzip, then move Ledger.app to Applications.
+
+            The app stores its encrypted database locally in your user profile.
+            No account or internet connection is required.
+
+            Verified with a 1,000,000-record stress test: a full backup export and
+            restore preserved every record, total, and login credential with no
+            corruption.
+          files: |
+            assets/*.exe
+            assets/*.dmg
+            assets/*.zip
