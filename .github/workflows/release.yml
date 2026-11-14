@@ -84,12 +84,12 @@ jobs:
             release/*.zip
 
   publish:
-    name: Publish GitHub release
+    name: Verify and publish GitHub release
     needs:
       - windows
       - macos
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: macos-15
+    timeout-minutes: 30
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -98,6 +98,61 @@ jobs:
 
       - name: List release assets
         run: ls -lh assets
+
+      - name: Verify installers before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          dmgs=(assets/*.dmg)
+          zips=(assets/*.zip)
+          exes=(assets/*.exe)
+
+          echo "DMGs: ${#dmgs[@]}  ZIPs: ${#zips[@]}  EXEs: ${#exes[@]}"
+          if [ "${#dmgs[@]}" -ne 2 ] || [ "${#zips[@]}" -ne 2 ] || [ "${#exes[@]}" -ne 1 ]; then
+            echo "Unexpected release asset set"
+            exit 1
+          fi
+
+          for f in "${dmgs[@]}"; do
+            echo "::group::Verify $f"
+            hdiutil verify "$f"
+
+            mountpoint="$(mktemp -d "$RUNNER_TEMP/dmg.XXXXXX")"
+            hdiutil attach -readonly -nobrowse -mountpoint "$mountpoint" "$f" >/dev/null
+            app="$mountpoint/Ledger.app"
+            test -d "$app"
+
+            binary_archs="$(lipo -archs "$app/Contents/MacOS/Ledger")"
+            echo "binary architectures: $binary_archs"
+            native="$app/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers/build/Release/better_sqlite3.node"
+            native_info="$(file -b "$native")"
+            echo "native module: $native_info"
+
+            case "$f" in
+              *arm64*)
+                echo "$binary_archs" | grep -qw arm64
+                echo "$native_info" | grep -q arm64
+                ;;
+              *)
+                echo "$binary_archs" | grep -qw x86_64
+                echo "$native_info" | grep -q x86_64
+                ;;
+            esac
+
+            hdiutil detach "$mountpoint" >/dev/null
+            rmdir "$mountpoint"
+            echo "::endgroup::"
+          done
+
+          for f in "${zips[@]}"; do
+            echo "Testing $f"
+            unzip -t "$f" >/dev/null
+          done
+
+          echo "Windows installer:"
+          file "${exes[0]}"
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -112,7 +167,7 @@ jobs:
             Offline, encrypted ledger for Windows and macOS.
 
             ### Downloads
-            - **Windows:** `Ledger Setup 1.0.0.exe`
+            - **Windows:** `Ledger.Setup.1.0.0.exe`
             - **macOS Intel:** `Ledger-1.0.0.dmg` (or `Ledger-1.0.0-mac.zip`)
             - **macOS Apple Silicon:** `Ledger-1.0.0-arm64.dmg` (or `Ledger-1.0.0-arm64-mac.zip`)
 

@@ -13,7 +13,7 @@
     "dev": "concurrently -k \"npm:dev:vite\" \"wait-on http://localhost:5173 && npm run dev:electron\"",
     "build": "vite build",
     "dist": "npm run build && electron-builder --win --publish never",
-    "dist:mac": "npm run build && electron-builder --mac --publish never"
+    "dist:mac": "npm run build && electron-builder --mac --x64 --arm64 --publish never"
   },
   "dependencies": {
     "better-sqlite3-multiple-ciphers": "^11.10.0",
@@ -56,20 +56,8 @@
     "mac": {
       "category": "public.app-category.finance",
       "target": [
-        {
-          "target": "dmg",
-          "arch": [
-            "x64",
-            "arm64"
-          ]
-        },
-        {
-          "target": "zip",
-          "arch": [
-            "x64",
-            "arm64"
-          ]
-        }
+        "dmg",
+        "zip"
       ],
       "minimumSystemVersion": "10.15.0",
       "hardenedRuntime": true,
